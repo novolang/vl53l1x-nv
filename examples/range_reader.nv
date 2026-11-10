@@ -51,24 +51,24 @@ fn digits(n: Int) [hw]
             div = div * 10
     for _k in 0..19
         if div > 0
-            hal.uart.write_byte(48 + (n / div) % 10)
+            hal.uart.write_byte(48 + n / div % 10)
             div = div / 10
 
 // Writes the line for a reading.
 @tier(embedded)
 fn report(r: RangeReading) [hw]
     match r.status
-        RangeValid =>
+        RangeValid      =>
             hal.uart.write("range ")
             digits(r.mm)
             hal.uart.write(" mm\n")
-        RangeWeak =>
+        RangeWeak       =>
             hal.uart.write("weak ")
             digits(r.mm)
             hal.uart.write(" mm\n")
         RangeOutOfRange => hal.uart.write("out of range\n")
-        RangeNoTarget => hal.uart.write("no target\n")
-        RangeFault => hal.uart.write("sensor fault\n")
+        RangeNoTarget   => hal.uart.write("no target\n")
+        RangeFault      => hal.uart.write("sensor fault\n")
 
 // Writes the 4 by 4 map, one line a row.
 @tier(embedded)
@@ -98,7 +98,7 @@ fn main() [hw]
         else
             match sensor.range_read()
                 Some(r) => report(r)
-                None => hal.uart.write("no answer\n")
+                None    => hal.uart.write("no answer\n")
         tick = tick + 1
         if tick % 10 == 0
             if sensor.zones_read(var zones)

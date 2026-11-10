@@ -151,7 +151,7 @@ impl I2cBus for FakeI2c
 
     fn write(self, addr: Int, data: [u8]) -> Bool [hw]
         log_push(self.c, 1)
-        let reg = (data[0] as Int) * 256 + (data[1] as Int)
+        let reg = data[0] as Int * 256 + data[1] as Int
         log_push(self.c, reg)
         for i in 2..data.len()
             log_push(self.c, data[i] as Int)
@@ -167,7 +167,7 @@ impl I2cBus for FakeI2c
 
     @tier(app)
     fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
-        let reg = (tx[0] as Int) * 256 + (tx[1] as Int)
+        let reg = tx[0] as Int * 256 + tx[1] as Int
         log_push(self.c, 2)
         log_push(self.c, reg)
         log_push(self.c, n)
@@ -265,7 +265,7 @@ fn started() -> Chip
 fn is_mode(r: ?Vl53Mode, want: Vl53Mode) -> Bool
     match r
         Some(x) => x == want
-        None => false
+        None    => false
 
 // How many polls of the data-ready flag the log holds: the reads of two bytes
 // from 0x0030.  A poll the part does not answer counts as "not ready" and the
@@ -281,12 +281,12 @@ fn polls_in(c: Chip) -> Int
 fn mm_of(r: ?RangeReading) -> Int
     match r
         Some(x) => x.mm
-        None => -1
+        None    => -1
 
 fn status_of(r: ?RangeReading) -> RangeStatus
     match r
         Some(x) => x.status
-        None => RangeStatus.RangeFault
+        None    => RangeStatus.RangeFault
 
 // ── The framing of the bus ───────────────────────────────────────────
 
@@ -579,7 +579,7 @@ fn test_start_fails_on_any_one_failed_transaction_but_a_lost_poll() [io, hw]
     test.assert(vl53l1x.start(dut(c), true))
     let n = at(c.st, 1)
     var failed = 0
-    for k in 1..(n + 1)
+    for k in 1..n + 1
         let c2 = chip()
         c2.st.insert(2, k)
         if not vl53l1x.start(dut(c2), true)
@@ -607,7 +607,10 @@ fn test_bring_up_cycles_xshut_when_the_wiring_has_the_pin() [io, hw]
     test.assert(vl53l1x.bring_up(p, true))
     test.assert_eq(at(p.pins.sets, 0), 0)
     let c3 = chip()
-    let nowhere = Dut { bus: FakeI2c { c: c3 }, pins: pins(c3), c: c3, w: DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None } }
+    let nowhere = Dut { bus: FakeI2c { c: c3 },
+        pins: pins(c3),
+        c: c3,
+        w: DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None } }
     test.assert(not vl53l1x.bring_up(nowhere, true))
 
 @test
@@ -807,7 +810,7 @@ fn test_a_mode_change_fails_on_any_one_failed_transaction() [io, hw]
     let c = chip()
     test.assert(vl53l1x.mode_write(dut(c), Vl53Mode.Vl53Short))
     let n = at(c.st, 1)
-    for k in 1..(n + 1)
+    for k in 1..n + 1
         let c2 = chip()
         c2.st.insert(2, k)
         test.assert(not vl53l1x.mode_write(dut(c2), Vl53Mode.Vl53Short))
@@ -1050,7 +1053,7 @@ fn test_the_result_block_is_read_in_one_transaction_and_decoded() [io, hw]
             test.assert_eq(x.ambient_kcps, 800)
             test.assert_eq(x.signal_kcps, 4800)
             test.assert_eq(x.range_mm, 291)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_a_result_read_fails_when_the_block_or_the_clear_fails() [io, hw]
@@ -1075,7 +1078,7 @@ fn test_one_measurement_clears_starts_waits_reads_and_stops() [io, hw]
     let r = vl53l1x.measure(dut(c))
     match r
         Some(x) => test.assert_eq(x.range_mm, 291)
-        None => test.assert(false)
+        None    => test.assert(false)
     // clear, start, then the flag, the block, clear and stop.
     test.assert_eq(at(c.log, 0), 1)
     test.assert_eq(at(c.log, 1), 0x0086)
@@ -1224,7 +1227,7 @@ fn test_a_scan_fails_on_any_one_failed_transaction_with_nothing_in_the_output() 
     // the part did not answer.  Every other transaction fails the scan, and the
     // output is empty.
     var failed = 0
-    for k in 1..(n + 1)
+    for k in 1..n + 1
         let c2 = started()
         c2.st.insert(2, k)
         var out: Vec[RangeReading; 64] = Vec.new()
@@ -1315,13 +1318,13 @@ fn test_the_sums_count_only_results_that_carry_a_distance() [io, hw]
             test.assert_eq(s.dist, 873)
             test.assert_eq(s.signal, 14400)
             test.assert_eq(s.spads, 60)
-        None => test.assert(false)
+        None    => test.assert(false)
     test.assert_eq(at(c.st, 24), 0)
     let c2 = started()
     c2.st.insert(40, 1)
     match vl53l1x.sums_run(dut(c2), 4)
         Some(s) => test.assert_eq(s.got, 2)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_the_sums_are_nothing_without_a_distance_or_a_result_or_a_start() [io, hw]
@@ -1507,7 +1510,9 @@ fn test_the_type_without_pins_over_absent_hardware() [io, hw]
 
 @test
 fn test_the_type_while_continuous_over_absent_hardware() [io, hw]
-    let d = vl53l1x.with_continuous(Vl53l1x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring()), true, true)
+    let d = vl53l1x.with_continuous(Vl53l1x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring()),
+        true,
+        true)
     test.assert_eq(d.range_start(), 0)
     test.assert_eq(d.zones_start(), -1)
     var out: Vec[RangeReading; 64] = Vec.new()

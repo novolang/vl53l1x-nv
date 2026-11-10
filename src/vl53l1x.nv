@@ -108,41 +108,41 @@ use dev_range.{ RangeReading, RangeStatus, Rangefinder, RangefinderZones }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
-let REG_I2C_ADDRESS = 0x0001
+let REG_I2C_ADDRESS    = 0x0001
 let REG_VHV_LOOP_BOUND = 0x0008
-let REG_VHV_TEMP = 0x000B
-let REG_XTALK_OFFSET = 0x0016
-let REG_XTALK_X = 0x0018
-let REG_XTALK_Y = 0x001A
-let REG_PART_OFFSET = 0x001E
-let REG_INNER_OFFSET = 0x0020
-let REG_OUTER_OFFSET = 0x0022
-let REG_CONFIG = 0x002D
-let REG_IO_SUPPLY = 0x002E
-let REG_GPIO_CTRL = 0x0030
-let REG_GPIO_STATUS = 0x0031
-let REG_INT_CONFIG = 0x0046
-let REG_PHASECAL = 0x004B
-let REG_TIMEOUT_A = 0x005E
-let REG_VCSEL_A = 0x0060
-let REG_TIMEOUT_B = 0x0061
-let REG_VCSEL_B = 0x0063
-let REG_SIGMA = 0x0064
-let REG_MIN_RATE = 0x0066
-let REG_PHASE_HIGH = 0x0069
-let REG_INTERMEASURE = 0x006C
-let REG_THRESH_HIGH = 0x0072
-let REG_THRESH_LOW = 0x0074
-let REG_WOI = 0x0078
-let REG_INITIAL_PHASE = 0x007A
-let REG_ROI_CENTRE = 0x007F
-let REG_ROI_SIZE = 0x0080
-let REG_INT_CLEAR = 0x0086
-let REG_MODE_START = 0x0087
-let REG_RESULT = 0x0089
-let REG_OSC = 0x00DE
-let REG_BOOT = 0x00E5
-let REG_MODEL = 0x010F
+let REG_VHV_TEMP       = 0x000B
+let REG_XTALK_OFFSET   = 0x0016
+let REG_XTALK_X        = 0x0018
+let REG_XTALK_Y        = 0x001A
+let REG_PART_OFFSET    = 0x001E
+let REG_INNER_OFFSET   = 0x0020
+let REG_OUTER_OFFSET   = 0x0022
+let REG_CONFIG         = 0x002D
+let REG_IO_SUPPLY      = 0x002E
+let REG_GPIO_CTRL      = 0x0030
+let REG_GPIO_STATUS    = 0x0031
+let REG_INT_CONFIG     = 0x0046
+let REG_PHASECAL       = 0x004B
+let REG_TIMEOUT_A      = 0x005E
+let REG_VCSEL_A        = 0x0060
+let REG_TIMEOUT_B      = 0x0061
+let REG_VCSEL_B        = 0x0063
+let REG_SIGMA          = 0x0064
+let REG_MIN_RATE       = 0x0066
+let REG_PHASE_HIGH     = 0x0069
+let REG_INTERMEASURE   = 0x006C
+let REG_THRESH_HIGH    = 0x0072
+let REG_THRESH_LOW     = 0x0074
+let REG_WOI            = 0x0078
+let REG_INITIAL_PHASE  = 0x007A
+let REG_ROI_CENTRE     = 0x007F
+let REG_ROI_SIZE       = 0x0080
+let REG_INT_CLEAR      = 0x0086
+let REG_MODE_START     = 0x0087
+let REG_RESULT         = 0x0089
+let REG_OSC            = 0x00DE
+let REG_BOOT           = 0x00E5
+let REG_MODEL          = 0x010F
 let REG_OPTICAL_CENTRE = 0x013E
 
 // The model ID and module type of Table 11, read as one 16-bit value.
@@ -150,20 +150,20 @@ let MODEL_ID = 0xEACC
 
 // SYSTEM__MODE_START.
 let RANGING_START = 0x40
-let RANGING_STOP = 0x00
+let RANGING_STOP  = 0x00
 
 // The phase-calibration timeout the two distance modes write.
 let PHASECAL_SHORT = 0x14
-let PHASECAL_LONG = 0x0A
+let PHASECAL_LONG  = 0x0A
 
 // SYSTEM__INTERRUPT_CONFIG_GPIO: new sample ready, and the no-target bit.
 let INT_NEW_SAMPLE = 0x20
-let INT_NO_TARGET = 0x40
+let INT_NO_TARGET  = 0x40
 
 // VHV loop bounds: the working two-bound setting and the full re-calibration.
 let VHV_TWO_BOUNDS = 0x09
-let VHV_FULL = 0x81
-let VHV_TEMP_FULL = 0x92
+let VHV_FULL       = 0x81
+let VHV_TEMP_FULL  = 0x92
 
 // The bus clock, I2C fast mode (datasheet: 400 kHz).
 let I2C_HZ = 400000
@@ -171,9 +171,9 @@ let I2C_HZ = 400000
 // How long the driver waits, in milliseconds: for the boot (1.2 ms at most),
 // for the first ranging of `start`, and for a result (the longest budget the
 // driver sets is 500 ms; 1100 leaves room for an inter-measurement period).
-let BOOT_MS = 2
-let BOOT_WAIT_MS = 100
-let CAL_WAIT_MS = 1000
+let BOOT_MS        = 2
+let BOOT_WAIT_MS   = 100
+let CAL_WAIT_MS    = 1000
 let RESULT_WAIT_MS = 1100
 
 // The most the part's register file holds in one write by this driver: a
@@ -184,7 +184,7 @@ let CHUNK = 30
 // longest range, from Table 4 of the datasheet (white target, 100 ms, dark).
 pub const CONFIG_LEN = 91
 let SHORT_MAX_MM = 1360
-let LONG_MAX_MM = 3600
+let LONG_MAX_MM  = 3600
 
 // The budget `range_start` answers when the part's budget is not one the table
 // knows, in microseconds: the longest the table has.
@@ -198,12 +198,12 @@ let IM_DEN = 1000
 let CAL_RESULTS = 50
 
 // The region of interest.
-let ROI_MIN = 4
-let ROI_MAX = 16
+let ROI_MIN         = 4
+let ROI_MAX         = 16
 let ROI_FULL_CENTRE = 199
-let ZONE_SIDE = 4
-let ZONE_COUNT = 16
-let ZONE_SPAN = 4
+let ZONE_SIDE       = 4
+let ZONE_COUNT      = 16
+let ZONE_SPAN       = 4
 
 // ST's default configuration, registers 0x2D to 0x87 in order
 // (VL51L1X_DEFAULT_CONFIGURATION).  The comments in the ultra-lite driver
@@ -221,8 +221,7 @@ pub const DEFAULT_CONFIG = [
     0x00, 0x08, 0x00, 0x00, 0x01, 0xCC, 0x0F, 0x01, 0xF1, 0x0D, 0x01, 0x68, 0x00, 0x80, 0x08,
     0xB8, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x89, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
     0x0F, 0x0D, 0x0E, 0x0E, 0x00, 0x00, 0x02, 0xC7, 0xFF, 0x9B, 0x00, 0x00, 0x00, 0x01, 0x00,
-    0x00
-]
+    0x00]
 
 // The distance modes of the ultra-lite driver (`SetDistanceMode` 1 and 2).  The
 // part has a medium mode too, which that driver does not set.
@@ -425,7 +424,7 @@ pub fn data_ready<P: Vl53l1xPort>(p: P) -> Bool [hw]
     var level = 1
     if ((b[0] as Int >> 4) & 1) == 1
         level = 0
-    ((b[1] as Int) & 1) == level
+    (b[1] as Int & 1) == level
 
 // Polls the data-ready flag for at most `timeout_ms`.  The flag is read at
 // least once.  A poll the part does not answer counts as "not ready" and is
@@ -548,7 +547,7 @@ pub fn budget_words(mode: Vl53Mode, ms: Int) -> Int
             if ms == 500
                 return (0x0591 << 16) | 0x05C1
             -1
-        Vl53Long =>
+        Vl53Long  =>
             if ms == 33
                 return (0x0060 << 16) | 0x006E
             if ms == 50
@@ -631,7 +630,7 @@ pub fn mode_write<P: Vl53l1xPort>(p: P, mode: Vl53Mode) -> Bool [hw]
     match mode
         Vl53Short =>
             ok = wr(p, REG_PHASECAL, PHASECAL_SHORT) and wr(p, REG_VCSEL_A, 0x07) and wr(p, REG_VCSEL_B, 0x05) and wr(p, REG_PHASE_HIGH, 0x38) and wr16(p, REG_WOI, 0x0705) and wr16(p, REG_INITIAL_PHASE, 0x0606)
-        Vl53Long =>
+        Vl53Long  =>
             ok = wr(p, REG_PHASECAL, PHASECAL_LONG) and wr(p, REG_VCSEL_A, 0x0F) and wr(p, REG_VCSEL_B, 0x0D) and wr(p, REG_PHASE_HIGH, 0xB8) and wr16(p, REG_WOI, 0x0F0D) and wr16(p, REG_INITIAL_PHASE, 0x0E0E)
     ok and budget_write(p, budget_for_mode(old, mode))
 
@@ -692,8 +691,8 @@ pub fn window_code(w: Vl53Window) -> Int
     match w
         WindowBelow => 0
         WindowAbove => 1
-        WindowOut => 2
-        WindowIn => 3
+        WindowOut   => 2
+        WindowIn    => 3
 
 // Arms the distance threshold interrupt (`SetDistanceThreshold`): the window,
 // whether it also fires with no target, and the two thresholds in millimetres.
@@ -836,13 +835,12 @@ pub fn result_read<P: Vl53l1xPort>(p: P) -> ?Vl53Result [hw]
     if not interrupt_clear(p)
         return None
     Some(Vl53Result {
-        raw_status: (b[0] as Int) & 0x1F,
+        raw_status: b[0] as Int & 0x1F,
         stream: b[2] as Int,
         spads: ((b[3] as Int << 8) | b[4] as Int) >> 8,
         ambient_kcps: ((b[7] as Int << 8) | b[8] as Int) * 8,
         signal_kcps: ((b[15] as Int << 8) | b[16] as Int) * 8,
-        range_mm: (b[13] as Int << 8) | b[14] as Int
-    })
+        range_mm: (b[13] as Int << 8) | b[14] as Int })
 
 // Waits for a result, at most 1.1 s, and reads it.
 pub fn result_wait<P: Vl53l1xPort>(p: P) -> ?Vl53Result [hw]
@@ -889,7 +887,7 @@ pub fn max_mm_of<P: Vl53l1xPort>(p: P) -> Int [hw]
             if m == Vl53Mode.Vl53Short
                 return SHORT_MAX_MM
             LONG_MAX_MM
-        None => 0
+        None    => 0
 
 // ── The zones ────────────────────────────────────────────────────────
 
@@ -913,7 +911,8 @@ pub fn zones_scan<P: Vl53l1xPort>(p: P, var out: Vec[RangeReading; 64]) -> Bool 
                 match measure(p)
                     Some(r) =>
                         let _ = out.push(reading_of(r.raw_status, r.range_mm))
-                    None => ok = false
+                    None    =>
+                        ok = false
             else
                 ok = false
     let back = roi_write(p, saved)
@@ -934,7 +933,8 @@ pub fn zones_start_of<P: Vl53l1xPort>(p: P, st: Vl53State) -> Int [hw]
 
 // What `zones_read` does: the scan of `zones_scan`, refused with `out` empty
 // while the part ranges continuously.
-pub fn zones_read_of<P: Vl53l1xPort>(p: P, st: Vl53State, var out: Vec[RangeReading; 64]) -> Bool [hw]
+pub fn zones_read_of<P: Vl53l1xPort>(p: P, st: Vl53State,
+                                     var out: Vec[RangeReading; 64]) -> Bool [hw]
     if st.continuous
         out.clear()
         return false
@@ -945,7 +945,7 @@ pub fn zones_read_of<P: Vl53l1xPort>(p: P, st: Vl53State, var out: Vec[RangeRead
 // Floor-free division toward zero, as C does it.
 pub fn div_trunc(a: Int, b: Int) -> Int
     if a < 0
-        return 0 - ((0 - a) / b)
+        return 0 - (0 - a) / b
     a / b
 
 // The offset in millimetres: the register holds it with two fraction bits in
@@ -992,7 +992,8 @@ pub fn sums_run<P: Vl53l1xPort>(p: P, n: Int) -> ?Vl53Sums [hw]
                         dist = dist + r.range_mm
                         signal = signal + r.signal_kcps
                         spads = spads + r.spads
-                None => ok = false
+                None    =>
+                    ok = false
     let _stopped = ranging_stop(p)
     if not ok or got == 0
         return None
@@ -1004,7 +1005,7 @@ pub fn sums_run<P: Vl53l1xPort>(p: P, n: Int) -> ?Vl53Sums [hw]
 // written.  Answers the offset in millimetres, or `None`.
 // NOT VERIFIED on a part: the arithmetic is tested against hand-worked sums.
 pub fn calibrate_offset<P: Vl53l1xPort>(p: P, target_mm: Int) -> ?Int [hw]
-    if not (offset_write(p, 0))
+    if not offset_write(p, 0)
         return None
     let Some(s) = sums_run(p, CAL_RESULTS) else return None
     let offset = target_mm - s.dist / s.got
@@ -1082,7 +1083,11 @@ pub fn with_continuous(d: Vl53l1x, ok: Bool, on: Bool) -> Vl53l1x
 pub fn with_addr(d: Vl53l1x, ok: Bool, addr: Int) -> Vl53l1x
     if not ok
         return d
-    Vl53l1x { bus: d.bus, timer: d.timer, pins: d.pins, w: DeviceWiring { bus: d.w.bus, addr: Some(addr & 0x7F), cs: None, irq: d.w.irq, en: d.w.en }, st: d.st }
+    Vl53l1x { bus: d.bus,
+        timer: d.timer,
+        pins: d.pins,
+        w: DeviceWiring { bus: d.w.bus, addr: Some(addr & 0x7F), cs: None, irq: d.w.irq, en: d.w.en },
+        st: d.st }
 
 impl Vl53l1x
     // The part at `w.addr` on the board's I2C bus, as a board's device table

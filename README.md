@@ -20,6 +20,20 @@ nRF54LM20 DK and has not been flashed. The offset and cross-talk calibrations
 are tested against hand-worked sums only; their results on a part are NOT
 VERIFIED.
 
+## Install
+
+```sh
+novo pkg add vl53l1x-nv
+```
+
+The device program is `examples/range_reader.nv`.  Make it the `main` of a package that
+depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+```
+
 ## The device program
 
 `examples/range_reader.nv` brings the sensor up in long distance mode with a
@@ -49,24 +63,24 @@ fn digits(n: Int) [hw]
             div = div * 10
     for _k in 0..19
         if div > 0
-            hal.uart.write_byte(48 + (n / div) % 10)
+            hal.uart.write_byte(48 + n / div % 10)
             div = div / 10
 
 // Writes the line for a reading.
 @tier(embedded)
 fn report(r: RangeReading) [hw]
     match r.status
-        RangeValid =>
+        RangeValid      =>
             hal.uart.write("range ")
             digits(r.mm)
             hal.uart.write(" mm\n")
-        RangeWeak =>
+        RangeWeak       =>
             hal.uart.write("weak ")
             digits(r.mm)
             hal.uart.write(" mm\n")
         RangeOutOfRange => hal.uart.write("out of range\n")
-        RangeNoTarget => hal.uart.write("no target\n")
-        RangeFault => hal.uart.write("sensor fault\n")
+        RangeNoTarget   => hal.uart.write("no target\n")
+        RangeFault      => hal.uart.write("sensor fault\n")
 
 @tier(embedded)
 fn main() [hw]
@@ -85,7 +99,7 @@ fn main() [hw]
         else
             match sensor.range_read()
                 Some(r) => report(r)
-                None => hal.uart.write("no answer\n")
+                None    => hal.uart.write("no answer\n")
         hal.timer.delay_ms(100)
 ```
 
