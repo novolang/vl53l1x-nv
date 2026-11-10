@@ -1,0 +1,1525 @@
+// vl53l1x_tests — the driver over a double of the part: a flat register file
+// with 16-bit addresses that answers the model ID, module type and mask
+// revision of the datasheet (DocID031281 Rev 3, Table 11: 0xEA, 0xCC, 0x10),
+// counts down the boot status, and behaves as ST's ultra-lite driver
+// expects: a write of 0x40 to SYSTEM__MODE_START starts ranging and makes a
+// result pending after some polls of GPIO__TIO_HV_STATUS, a write of 0x01 to
+// SYSTEM__INTERRUPT_CLEAR clears the flag and, while ranging, makes the next
+// result pending, a write of 0x00 stops ranging, and a write to
+// I2C_SLAVE__DEVICE_ADDRESS moves the address.  Every transaction advances the
+// clock by a millisecond.  The log keeps what the controller sent, in a form
+// the tests compare.
+//
+// Log entries: a write is 1, the register, the bytes, -1; a read is 2, the
+// register, the count, -1.
+//
+// The double's state `st`:
+//   0 the clock in ms   1 transactions so far   2 the transaction that fails
+//   3 the first transaction of a run that all fail   4 1 when a part is there
+//   11 boot-status reads that answer 0 first
+//   20 polls of the flag before a result is ready   21 1 when it never is
+//   22 polls left   23 1 while a result is pending   24 1 while ranging
+//   30 the I2C address the part answers at   31 the bus clock
+//   40 1 when every second result block reads status 12   41 blocks read
+//   99 entries in the log
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_range.{ RangeReading, RangeStatus, Rangefinder, RangefinderZones }
+use dev_id.{ DeviceId, Identifiable }
+use vl53l1x
+use vl53l1x.{ Vl53l1x, Vl53State, Vl53Mode, Vl53Window, Vl53Roi, Vl53Result, Vl53l1xPort }
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn put(c: Chip, reg: Int, v: Int)
+    c.regs.insert(reg, v)
+
+fn put16(c: Chip, reg: Int, v: Int)
+    c.regs.insert(reg, (v >> 8) & 0xFF)
+    c.regs.insert(reg + 1, v & 0xFF)
+
+// The part as it comes out of the default configuration, in long mode with a
+// 100 ms budget, a result block of a good 291 mm range, an oscillator value of
+// 0x1234 (bits 9:0 are 564) and an optical centre of 0xA5.
+@tier(app)
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    put(c, 0x010F, 0xEA)
+    put(c, 0x0110, 0xCC)
+    put(c, 0x0111, 0x10)
+    put(c, 0x00E5, 0x03)
+    put(c, 0x0030, 0x01)
+    put(c, 0x0046, 0x20)
+    put(c, 0x004B, 0x0A)
+    put16(c, 0x005E, 0x01CC)
+    put(c, 0x0060, 0x0F)
+    put16(c, 0x0061, 0x01EA)
+    put(c, 0x0063, 0x0D)
+    put16(c, 0x0064, 0x0168)
+    put16(c, 0x0066, 0x0080)
+    put16(c, 0x00DE, 0x1234)
+    put(c, 0x007F, 0xC7)
+    put(c, 0x0080, 0xFF)
+    put(c, 0x013E, 0xA5)
+    put(c, 0x0089, 9)
+    put(c, 0x008B, 5)
+    put16(c, 0x008C, 0x1400)
+    put16(c, 0x0090, 100)
+    put16(c, 0x0096, 291)
+    put16(c, 0x0098, 600)
+    c.st.insert(4, 1)
+    c.st.insert(20, 1)
+    c.st.insert(30, 0x29)
+    c
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// A register as the part answers it.
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x00E5 and at(c.st, 11) > 0
+        c.st.insert(11, at(c.st, 11) - 1)
+        return 0
+    if reg == 0x0089 and at(c.st, 40) == 1
+        let n = at(c.st, 41)
+        c.st.insert(41, n + 1)
+        if n % 2 == 1
+            return 12
+    if reg == 0x0031
+        var ready = false
+        if at(c.st, 23) == 1 and at(c.st, 21) == 0
+            if at(c.st, 22) > 0
+                c.st.insert(22, at(c.st, 22) - 1)
+            else
+                ready = true
+        var pol = 1
+        if ((at(c.regs, 0x0030) >> 4) & 1) == 1
+            pol = 0
+        if ready
+            return pol
+        return 1 - pol
+    at(c.regs, reg)
+
+// A write: a start makes a result pending, a clear ends the pending one and,
+// while ranging, begins the next, a stop ends it all, 0x01 moves the address.
+fn chip_write(c: Chip, reg: Int, v: Int)
+    c.regs.insert(reg, v)
+    if reg == 0x0087
+        if v == 0x40
+            c.st.insert(24, 1)
+            c.st.insert(23, 1)
+            c.st.insert(22, at(c.st, 20))
+        if v == 0x00
+            c.st.insert(24, 0)
+            c.st.insert(23, 0)
+    if reg == 0x0086 and (v & 1) == 1
+        c.st.insert(23, 0)
+        if at(c.st, 24) == 1
+            c.st.insert(23, 1)
+            c.st.insert(22, at(c.st, 20))
+    if reg == 0x0001
+        c.st.insert(30, v & 0x7F)
+
+// Whether the transaction now being made is one that fails.
+fn fails(c: Chip) -> Bool
+    let n = at(c.st, 1) + 1
+    c.st.insert(1, n)
+    c.st.insert(0, at(c.st, 0) + 1)
+    if at(c.st, 2) == n
+        return true
+    at(c.st, 3) > 0 and n >= at(c.st, 3)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(31, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        let reg = (data[0] as Int) * 256 + (data[1] as Int)
+        log_push(self.c, reg)
+        for i in 2..data.len()
+            log_push(self.c, data[i] as Int)
+        log_push(self.c, -1)
+        if fails(self.c) or addr != at(self.c.st, 30) or at(self.c.st, 4) == 0 or data.len() < 3
+            return false
+        for i in 2..data.len()
+            chip_write(self.c, reg + i - 2, data[i] as Int)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        let reg = (tx[0] as Int) * 256 + (tx[1] as Int)
+        log_push(self.c, 2)
+        log_push(self.c, reg)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if fails(self.c) or addr != at(self.c.st, 30) or at(self.c.st, 4) == 0
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, chip_read(self.c, reg + i) as u8)
+        Some(out)
+
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+    sets: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        let n = at(self.sets, 0)
+        self.sets.insert(n + 1, pin * 10 + val)
+        self.sets.insert(0, n + 1)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new(), sets: HashMap.new() }
+
+// The part's wiring: address 0x29, GPIO1 on pin 7, XSHUT on pin 8.
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_en(dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x29), 7), 8)
+
+fn wiring_plain() -> DeviceWiring
+    dev_bus.wiring_i2c(0, 0x29)
+
+struct Dut
+    bus: FakeI2c
+    pins: FakePins
+    c: Chip
+    w: DeviceWiring
+
+impl Vl53l1xPort for Dut
+    fn setup(self) -> Bool [hw]
+        vl53l1x.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        vl53l1x.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+        vl53l1x.i2c_write_from(self.bus, self.w, reg, src)
+
+    fn now_ms(self) -> Int [hw]
+        at(self.c.st, 0)
+
+    fn wait_ms(self, ms: Int) [hw]
+        self.c.st.insert(0, at(self.c.st, 0) + ms)
+
+    fn irq_level(self) -> Int [hw]
+        vl53l1x.irq_level_of(self.pins, self.w)
+
+    fn xshut(self, level: Int) -> Bool [hw]
+        vl53l1x.xshut_of(self.pins, self.w, level)
+
+@tier(app)
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, pins: pins(c), c: c, w: wiring() }
+
+@tier(app)
+fn dut_plain(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, pins: pins(c), c: c, w: wiring_plain() }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+// A part that is up: the table and the first ranging done.
+@tier(app)
+fn started() -> Chip
+    let c = chip()
+    test.assert(vl53l1x.start(dut(c), true))
+    log_clear(c)
+    c.st.insert(1, 0)
+    c
+
+// Whether `r` is the mode `want`.
+fn is_mode(r: ?Vl53Mode, want: Vl53Mode) -> Bool
+    match r
+        Some(x) => x == want
+        None => false
+
+// How many polls of the data-ready flag the log holds: the reads of two bytes
+// from 0x0030.  A poll the part does not answer counts as "not ready" and the
+// wait goes on, so a sweep that fails each transaction in turn finds exactly
+// these tolerated.
+fn polls_in(c: Chip) -> Int
+    var n = 0
+    for i in 0..at(c.st, 99)
+        if at(c.log, i) == 2 and at(c.log, i + 1) == 0x0030 and at(c.log, i + 2) == 2 and at(c.log, i + 3) == -1
+            n = n + 1
+    n
+
+fn mm_of(r: ?RangeReading) -> Int
+    match r
+        Some(x) => x.mm
+        None => -1
+
+fn status_of(r: ?RangeReading) -> RangeStatus
+    match r
+        Some(x) => x.status
+        None => RangeStatus.RangeFault
+
+// ── The framing of the bus ───────────────────────────────────────────
+
+@test
+fn test_a_register_read_sends_the_address_high_byte_first() [io, hw]
+    let c = chip()
+    put(c, 0x0123, 0x77)
+    put16(c, 0x0124, 0xABCD)
+    put16(c, 0x0126, 0x1234)
+    let d = dut(c)
+    test.assert(vl53l1x.rd(d, 0x0123) == Some(0x77))
+    log_is(c, [2, 0x0123, 1, -1])
+    test.assert(vl53l1x.rd16(d, 0x0124) == Some(0xABCD))
+    log_is(c, [2, 0x0124, 2, -1])
+    test.assert(vl53l1x.rd32(d, 0x0124) == Some(0xABCD1234))
+    log_is(c, [2, 0x0124, 4, -1])
+
+@test
+fn test_a_register_write_sends_the_address_then_the_value_most_significant_byte_first() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.wr(d, 0x0200, 0x1AB))
+    log_is(c, [1, 0x0200, 0xAB, -1])
+    test.assert(vl53l1x.wr16(d, 0x0210, 0xA1B2))
+    log_is(c, [1, 0x0210, 0xA1, 0xB2, -1])
+    test.assert(vl53l1x.wr32(d, 0x0220, 0x01020304))
+    log_is(c, [1, 0x0220, 0x01, 0x02, 0x03, 0x04, -1])
+    test.assert_eq(at(c.regs, 0x0223), 0x04)
+
+@test
+fn test_update_changes_only_the_bits_of_the_mask() [io, hw]
+    let c = chip()
+    put(c, 0x0300, 0b10100101)
+    let d = dut(c)
+    test.assert(vl53l1x.upd(d, 0x0300, 0b00001111, 0b00000011))
+    test.assert_eq(at(c.regs, 0x0300), 0b10100011)
+    log_is(c, [2, 0x0300, 1, -1, 1, 0x0300, 0b10100011, -1])
+    c.st.insert(4, 0)
+    test.assert(not vl53l1x.upd(d, 0x0300, 0xFF, 0))
+
+@test
+fn test_a_failed_read_or_write_answers_nothing_or_false() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(4, 0)
+    test.assert(vl53l1x.rd(d, 0x0123) == None)
+    test.assert(vl53l1x.rd16(d, 0x0123) == None)
+    test.assert(vl53l1x.rd32(d, 0x0123) == None)
+    test.assert(not vl53l1x.wr(d, 0x0123, 1))
+    test.assert(not vl53l1x.wr16(d, 0x0123, 1))
+    test.assert(not vl53l1x.wr32(d, 0x0123, 1))
+
+@test
+fn test_the_bus_is_set_up_at_400_khz_with_gpio1_an_input_and_xshut_an_output() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.i2c_setup(d.bus, d.pins, d.w))
+    test.assert_eq(at(c.st, 31), 400000)
+    test.assert_eq(at(d.pins.modes, 7), 0)
+    test.assert_eq(at(d.pins.modes, 8), 1)
+    let p = dut_plain(chip())
+    test.assert(vl53l1x.i2c_setup(p.bus, p.pins, p.w))
+    test.assert_eq(at(p.pins.modes, 7), 0)
+    let nowhere = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not vl53l1x.i2c_setup(p.bus, p.pins, nowhere))
+
+@test
+fn test_the_pins_are_driven_and_read_through_the_wiring() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    d.pins.levels.insert(7, 1)
+    test.assert_eq(vl53l1x.irq_level_of(d.pins, d.w), 1)
+    test.assert(vl53l1x.xshut_of(d.pins, d.w, 0))
+    test.assert_eq(at(d.pins.levels, 8), 0)
+    let p = dut_plain(c)
+    test.assert_eq(vl53l1x.irq_level_of(p.pins, p.w), -1)
+    test.assert(not vl53l1x.xshut_of(p.pins, p.w, 1))
+
+// ── Identity and boot ────────────────────────────────────────────────
+
+@test
+fn test_the_identity_is_the_model_id_and_module_type_with_the_revision() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    let id = vl53l1x.id_read(d)
+    test.assert(id == Some(DeviceId { who: 0xEACC, rev: Some(0x10) }))
+    log_is(c, [2, 0x010F, 3, -1])
+    test.assert(vl53l1x.model_ok(d))
+
+@test
+fn test_another_part_or_no_part_is_not_a_vl53l1x() [io, hw]
+    let c = chip()
+    put(c, 0x010F, 0xEB)
+    put(c, 0x0110, 0xAA)
+    test.assert(vl53l1x.id_read(dut(c)) == None)
+    test.assert(not vl53l1x.model_ok(dut(c)))
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert(vl53l1x.id_read(dut(c2)) == None)
+
+@test
+fn test_the_boot_wait_ends_when_the_status_is_not_zero() [io, hw]
+    let c = chip()
+    c.st.insert(11, 3)
+    test.assert(vl53l1x.boot_wait(dut(c)))
+    test.assert_eq(at(c.st, 99), 4 * 4)
+
+@test
+fn test_the_boot_wait_gives_up_after_100_ms_and_when_the_part_is_silent() [io, hw]
+    let c = chip()
+    c.st.insert(11, 1000)
+    test.assert(not vl53l1x.boot_wait(dut(c)))
+    test.assert(at(c.st, 0) >= 100)
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert(not vl53l1x.boot_wait(dut(c2)))
+
+@test
+fn test_the_reset_cycle_drops_xshut_waits_raises_it_and_waits() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.reset_cycle(d))
+    test.assert_eq(at(d.pins.sets, 0), 2)
+    test.assert_eq(at(d.pins.sets, 1), 80)
+    test.assert_eq(at(d.pins.sets, 2), 81)
+    test.assert_eq(at(c.st, 0), 4)
+    let p = dut_plain(chip())
+    test.assert(not vl53l1x.reset_cycle(p))
+    test.assert_eq(at(p.c.st, 0), 0)
+
+// ── The data-ready flag, the interrupt, ranging ──────────────────────
+
+@test
+fn test_data_ready_compares_the_status_bit_with_the_polarity() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(23, 1)
+    c.st.insert(22, 0)
+    test.assert(vl53l1x.data_ready(d))
+    log_is(c, [2, 0x0030, 2, -1])
+    c.st.insert(22, 2)
+    test.assert(not vl53l1x.data_ready(d))
+    test.assert(not vl53l1x.data_ready(d))
+    test.assert(vl53l1x.data_ready(d))
+    // Active low: bit 4 of the control register set; the state bit is 0 when a
+    // result waits and 1 when none does.
+    put(c, 0x0030, 0x11)
+    c.st.insert(22, 0)
+    test.assert(vl53l1x.data_ready(d))
+    c.st.insert(23, 0)
+    test.assert(not vl53l1x.data_ready(d))
+    c.st.insert(4, 0)
+    test.assert(not vl53l1x.data_ready(d))
+
+@test
+fn test_waiting_for_the_flag_ends_at_the_timeout_or_when_the_part_is_silent() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(23, 1)
+    c.st.insert(22, 3)
+    test.assert(vl53l1x.ready_wait(d, 50))
+    let c2 = chip()
+    c2.st.insert(23, 1)
+    c2.st.insert(21, 1)
+    test.assert(not vl53l1x.ready_wait(dut(c2), 20))
+    test.assert(at(c2.st, 0) >= 20)
+
+@test
+fn test_clear_start_and_stop_write_the_three_registers() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.interrupt_clear(d))
+    test.assert(vl53l1x.ranging_start(d))
+    test.assert(vl53l1x.ranging_stop(d))
+    log_is(c, [1, 0x0086, 0x01, -1, 1, 0x0087, 0x40, -1, 1, 0x0087, 0x00, -1])
+
+@test
+fn test_the_interrupt_polarity_is_bit_4_of_the_control_register_inverted() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.polarity_read(d) == Some(true))
+    test.assert(vl53l1x.polarity_write(d, false))
+    test.assert_eq(at(c.regs, 0x0030), 0x11)
+    test.assert(vl53l1x.polarity_read(d) == Some(false))
+    test.assert(vl53l1x.polarity_write(d, true))
+    test.assert_eq(at(c.regs, 0x0030), 0x01)
+    c.st.insert(4, 0)
+    test.assert(vl53l1x.polarity_read(d) == None)
+    test.assert(not vl53l1x.polarity_write(d, true))
+
+// ── The default configuration and the start ──────────────────────────
+
+@test
+fn test_the_default_configuration_is_91_bytes_and_ends_at_register_0x87() [io, hw]
+    test.assert_eq(vl53l1x.CONFIG_LEN, 91)
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG.len(), 91)
+    // The bytes the ultra-lite driver names: the polarity register 0x30 (index
+    // 3), the interrupt configuration 0x46 (index 25), the sigma threshold
+    // 0x64/0x65 (index 55, 56), the signal threshold 0x66/0x67 (57, 58), the ROI
+    // centre 0x7F (82) and size 0x80 (83), and the start register 0x87 (90).
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG[3], 0x01)
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG[0x46 - 0x2D], 0x20)
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG[0x64 - 0x2D], 0x01)
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG[0x65 - 0x2D], 0x68)
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG[0x66 - 0x2D], 0x00)
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG[0x67 - 0x2D], 0x80)
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG[0x7F - 0x2D], 0xC7)
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG[0x80 - 0x2D], 0xFF)
+    test.assert_eq(vl53l1x.DEFAULT_CONFIG[0x87 - 0x2D], 0x00)
+
+@test
+fn test_the_configuration_goes_out_in_four_bursts() [io, hw]
+    let c = chip()
+    test.assert(vl53l1x.config_write(dut(c)))
+    test.assert_eq(at(c.st, 1), 4)
+    // The log: write, register, 30 bytes, -1 -- three times -- then the last byte.
+    test.assert_eq(at(c.log, 0), 1)
+    test.assert_eq(at(c.log, 1), 0x002D)
+    test.assert_eq(at(c.log, 2 + 30), -1)
+    test.assert_eq(at(c.log, 33 + 1), 0x004B)
+    test.assert_eq(at(c.log, 66 + 1), 0x0069)
+    test.assert_eq(at(c.log, 99 + 1), 0x0087)
+    test.assert_eq(at(c.log, 99 + 2), 0x00)
+    test.assert_eq(at(c.log, 99 + 3), -1)
+    for i in 0..91
+        test.assert_eq(at(c.regs, 0x002D + i), vl53l1x.DEFAULT_CONFIG[i])
+
+@test
+fn test_the_configuration_fails_on_any_one_failed_burst() [io, hw]
+    for k in 1..5
+        let c = chip()
+        c.st.insert(2, k)
+        test.assert(not vl53l1x.config_write(dut(c)))
+
+@test
+fn test_start_runs_the_ultra_lite_sequence_in_order() [io, hw]
+    let c = chip()
+    c.st.insert(11, 1)
+    test.assert(vl53l1x.start(dut(c), true))
+    // The model read, the boot status twice (the part answers 0 once), the four
+    // table bursts, the 2.8 V bit (read, write), then the VHV cycle: start, the
+    // flag, clear, stop, the loop bound, the temperature register.
+    test.assert_eq(at(c.log, 0), 2)
+    test.assert_eq(at(c.log, 4), 2)
+    test.assert_eq(at(c.log, 5), 0x00E5)
+    test.assert_eq(at(c.log, 8), 2)
+    test.assert_eq(at(c.log, 9), 0x00E5)
+    test.assert_eq(at(c.log, 12), 1)
+    test.assert_eq(at(c.log, 13), 0x002D)
+    // 12 entries + 3 x 33 + 4 for the last burst = 115; the 2.8 V bit follows.
+    test.assert_eq(at(c.log, 115), 2)
+    test.assert_eq(at(c.log, 116), 0x002E)
+    test.assert_eq(at(c.log, 119), 1)
+    test.assert_eq(at(c.log, 120), 0x002E)
+    test.assert_eq(at(c.log, 121), 0x01)
+    // The VHV cycle: start, flag polls (the flag is read after one poll), clear,
+    // stop, loop bound, temperature.
+    test.assert_eq(at(c.log, 123), 1)
+    test.assert_eq(at(c.log, 124), 0x0087)
+    test.assert_eq(at(c.log, 125), 0x40)
+    test.assert_eq(at(c.regs, 0x0087), 0x00)
+    test.assert_eq(at(c.regs, 0x0008), 0x09)
+    test.assert_eq(at(c.regs, 0x000B), 0x00)
+    test.assert_eq(at(c.regs, 0x002E), 0x01)
+    test.assert_eq(at(c.st, 24), 0)
+    // 16 transactions: the model, two boot reads, four bursts, the 2.8 V bit
+    // (read and write), the VHV cycle's start, two polls, clear, stop and two
+    // registers put back.
+    test.assert_eq(at(c.st, 1), 16)
+
+@test
+fn test_start_leaves_the_io_supply_bit_alone_when_not_asked() [io, hw]
+    let c = chip()
+    test.assert(vl53l1x.start(dut(c), false))
+    test.assert_eq(at(c.regs, 0x002E), 0x00)
+
+@test
+fn test_start_fails_for_another_part_and_for_a_part_that_never_boots() [io, hw]
+    let c = chip()
+    put(c, 0x010F, 0x00)
+    test.assert(not vl53l1x.start(dut(c), true))
+    test.assert_eq(at(c.regs, 0x002D), 0)
+    let c2 = chip()
+    c2.st.insert(11, 100000)
+    test.assert(not vl53l1x.start(dut(c2), true))
+
+@test
+fn test_start_fails_on_any_one_failed_transaction_but_a_lost_poll() [io, hw]
+    let c = chip()
+    test.assert(vl53l1x.start(dut(c), true))
+    let n = at(c.st, 1)
+    var failed = 0
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(2, k)
+        if not vl53l1x.start(dut(c2), true)
+            failed = failed + 1
+    test.assert_eq(failed, n - polls_in(c))
+
+@test
+fn test_start_restores_the_vhv_registers_when_the_first_ranging_never_finishes() [io, hw]
+    let c = chip()
+    c.st.insert(21, 1)
+    test.assert(not vl53l1x.start(dut(c), true))
+    test.assert_eq(at(c.regs, 0x0087), 0x00)
+    test.assert_eq(at(c.regs, 0x0008), 0x09)
+    test.assert(at(c.st, 0) >= 1000)
+
+@test
+fn test_bring_up_cycles_xshut_when_the_wiring_has_the_pin() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.bring_up(d, true))
+    test.assert_eq(at(d.pins.sets, 0), 2)
+    test.assert_eq(at(d.pins.modes, 8), 1)
+    let c2 = chip()
+    let p = dut_plain(c2)
+    test.assert(vl53l1x.bring_up(p, true))
+    test.assert_eq(at(p.pins.sets, 0), 0)
+    let c3 = chip()
+    let nowhere = Dut { bus: FakeI2c { c: c3 }, pins: pins(c3), c: c3, w: DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None } }
+    test.assert(not vl53l1x.bring_up(nowhere, true))
+
+@test
+fn test_the_vhv_cycle_without_the_full_search_leaves_the_loop_bound_alone() [io, hw]
+    let c = started()
+    test.assert(vl53l1x.vhv_cycle(dut(c), false))
+    test.assert_eq(at(c.log, 0), 1)
+    test.assert_eq(at(c.log, 1), 0x0087)
+    test.assert_eq(at(c.log, 2), 0x40)
+    test.assert_eq(at(c.regs, 0x0008), 0x09)
+    test.assert_eq(at(c.regs, 0x0087), 0x00)
+
+@test
+fn test_the_budget_getter_tells_a_silent_part_from_an_unknown_budget() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.budget_get(d) == Some(100))
+    put16(c, 0x005E, 0x1111)
+    test.assert(vl53l1x.budget_get(d) == Some(0))
+    c.st.insert(4, 0)
+    test.assert(vl53l1x.budget_get(d) == None)
+
+@test
+fn test_a_temperature_update_runs_the_full_vhv_search() [io, hw]
+    let c = started()
+    test.assert(vl53l1x.temperature_update(dut(c)))
+    test.assert_eq(at(c.log, 0), 1)
+    test.assert_eq(at(c.log, 1), 0x0008)
+    test.assert_eq(at(c.log, 2), 0x81)
+    test.assert_eq(at(c.log, 4), 1)
+    test.assert_eq(at(c.log, 5), 0x000B)
+    test.assert_eq(at(c.log, 6), 0x92)
+    test.assert_eq(at(c.regs, 0x0008), 0x09)
+    test.assert_eq(at(c.regs, 0x000B), 0x00)
+    test.assert_eq(at(c.regs, 0x0087), 0x00)
+    let c2 = started()
+    c2.st.insert(2, 1)
+    test.assert(not vl53l1x.temperature_update(dut(c2)))
+    test.assert_eq(at(c2.regs, 0x0008), 0x09)
+
+// ── The distance mode and the timing budget ──────────────────────────
+
+@test
+fn test_the_budget_tables_have_the_rows_of_the_ultra_lite_driver() [io, hw]
+    let sh = Vl53Mode.Vl53Short
+    let lg = Vl53Mode.Vl53Long
+    test.assert_eq(vl53l1x.budget_words(sh, 15), (0x001D << 16) | 0x0027)
+    test.assert_eq(vl53l1x.budget_words(sh, 20), (0x0051 << 16) | 0x006E)
+    test.assert_eq(vl53l1x.budget_words(sh, 33), (0x00D6 << 16) | 0x006E)
+    test.assert_eq(vl53l1x.budget_words(sh, 50), (0x01AE << 16) | 0x01E8)
+    test.assert_eq(vl53l1x.budget_words(sh, 100), (0x02E1 << 16) | 0x0388)
+    test.assert_eq(vl53l1x.budget_words(sh, 200), (0x03E1 << 16) | 0x0496)
+    test.assert_eq(vl53l1x.budget_words(sh, 500), (0x0591 << 16) | 0x05C1)
+    test.assert_eq(vl53l1x.budget_words(sh, 40), -1)
+    test.assert_eq(vl53l1x.budget_words(lg, 33), (0x0060 << 16) | 0x006E)
+    test.assert_eq(vl53l1x.budget_words(lg, 50), (0x00AD << 16) | 0x00C6)
+    test.assert_eq(vl53l1x.budget_words(lg, 100), (0x01CC << 16) | 0x01EA)
+    test.assert_eq(vl53l1x.budget_words(lg, 200), (0x02D9 << 16) | 0x02F8)
+    test.assert_eq(vl53l1x.budget_words(lg, 500), (0x048F << 16) | 0x04A4)
+    // 15 ms is short mode only, and the datasheet allows 20 ms in short mode only.
+    test.assert_eq(vl53l1x.budget_words(lg, 15), -1)
+    test.assert_eq(vl53l1x.budget_words(lg, 20), -1)
+    test.assert_eq(vl53l1x.budget_words(lg, 40), -1)
+
+@test
+fn test_the_budget_is_read_back_from_register_a_in_either_mode() [io, hw]
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x001D), 15)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x0051), 20)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x001E), 20)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x00D6), 33)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x0060), 33)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x01AE), 50)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x00AD), 50)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x02E1), 100)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x01CC), 100)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x03E1), 200)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x02D9), 200)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x0591), 500)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x048F), 500)
+    test.assert_eq(vl53l1x.budget_ms_of_word(0x1234), 0)
+
+@test
+fn test_the_mode_comes_from_the_phase_calibration_timeout() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(is_mode(vl53l1x.mode_read(d), Vl53Mode.Vl53Long))
+    put(c, 0x004B, 0x14)
+    test.assert(is_mode(vl53l1x.mode_read(d), Vl53Mode.Vl53Short))
+    put(c, 0x004B, 0x00)
+    test.assert(vl53l1x.mode_read(d) == None)
+    c.st.insert(4, 0)
+    test.assert(vl53l1x.mode_read(d) == None)
+
+@test
+fn test_the_budget_is_written_as_the_two_timeout_words_of_the_mode() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(vl53l1x.budget_read(d), 100)
+    test.assert(vl53l1x.budget_write(d, 50))
+    test.assert_eq(at(c.regs, 0x005E), 0x00)
+    test.assert_eq(at(c.regs, 0x005F), 0xAD)
+    test.assert_eq(at(c.regs, 0x0061), 0x00)
+    test.assert_eq(at(c.regs, 0x0062), 0xC6)
+    test.assert_eq(vl53l1x.budget_read(d), 50)
+    test.assert(not vl53l1x.budget_write(d, 20))
+    test.assert(not vl53l1x.budget_write(d, 15))
+    test.assert(not vl53l1x.budget_write(d, 40))
+    test.assert_eq(vl53l1x.budget_read(d), 50)
+
+@test
+fn test_short_mode_takes_15_and_20_ms() [io, hw]
+    let c = chip()
+    put(c, 0x004B, 0x14)
+    let d = dut(c)
+    test.assert(vl53l1x.budget_write(d, 15))
+    test.assert_eq(vl53l1x.budget_read(d), 15)
+    test.assert_eq(at(c.regs, 0x005F), 0x1D)
+    test.assert_eq(at(c.regs, 0x0062), 0x27)
+    test.assert(vl53l1x.budget_write(d, 20))
+    test.assert_eq(vl53l1x.budget_read(d), 20)
+
+@test
+fn test_the_budget_is_refused_in_no_known_mode_and_when_the_part_is_silent() [io, hw]
+    let c = chip()
+    put(c, 0x004B, 0x00)
+    test.assert(not vl53l1x.budget_write(dut(c), 100))
+    test.assert_eq(at(c.st, 1), 1)
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert_eq(vl53l1x.budget_read(dut(c2)), 0)
+    let c3 = chip()
+    c3.st.insert(2, 2)
+    test.assert(not vl53l1x.budget_write(dut(c3), 50))
+    let c4 = chip()
+    c4.st.insert(2, 3)
+    test.assert(not vl53l1x.budget_write(dut(c4), 50))
+
+@test
+fn test_a_new_mode_keeps_the_budget_or_steps_to_33_ms() [io, hw]
+    test.assert_eq(vl53l1x.budget_for_mode(100, Vl53Mode.Vl53Long), 100)
+    test.assert_eq(vl53l1x.budget_for_mode(15, Vl53Mode.Vl53Long), 33)
+    test.assert_eq(vl53l1x.budget_for_mode(20, Vl53Mode.Vl53Long), 33)
+    test.assert_eq(vl53l1x.budget_for_mode(15, Vl53Mode.Vl53Short), 15)
+    test.assert_eq(vl53l1x.budget_for_mode(0, Vl53Mode.Vl53Short), 100)
+
+@test
+fn test_short_mode_writes_the_registers_of_the_ultra_lite_driver() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.mode_write(d, Vl53Mode.Vl53Short))
+    test.assert_eq(at(c.regs, 0x004B), 0x14)
+    test.assert_eq(at(c.regs, 0x0060), 0x07)
+    test.assert_eq(at(c.regs, 0x0063), 0x05)
+    test.assert_eq(at(c.regs, 0x0069), 0x38)
+    test.assert_eq(at(c.regs, 0x0078), 0x07)
+    test.assert_eq(at(c.regs, 0x0079), 0x05)
+    test.assert_eq(at(c.regs, 0x007A), 0x06)
+    test.assert_eq(at(c.regs, 0x007B), 0x06)
+    // The budget of 100 ms is kept, in the short table.
+    test.assert_eq(at(c.regs, 0x005E), 0x02)
+    test.assert_eq(at(c.regs, 0x005F), 0xE1)
+    test.assert_eq(at(c.regs, 0x0061), 0x03)
+    test.assert_eq(at(c.regs, 0x0062), 0x88)
+    test.assert(is_mode(vl53l1x.mode_read(d), Vl53Mode.Vl53Short))
+
+@test
+fn test_long_mode_writes_its_registers_and_a_15_ms_budget_steps_to_33() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.mode_write(d, Vl53Mode.Vl53Short))
+    test.assert(vl53l1x.budget_write(d, 15))
+    test.assert(vl53l1x.mode_write(d, Vl53Mode.Vl53Long))
+    test.assert_eq(at(c.regs, 0x004B), 0x0A)
+    test.assert_eq(at(c.regs, 0x0060), 0x0F)
+    test.assert_eq(at(c.regs, 0x0063), 0x0D)
+    test.assert_eq(at(c.regs, 0x0069), 0xB8)
+    test.assert_eq(at(c.regs, 0x0078), 0x0F)
+    test.assert_eq(at(c.regs, 0x0079), 0x0D)
+    test.assert_eq(at(c.regs, 0x007A), 0x0E)
+    test.assert_eq(at(c.regs, 0x007B), 0x0E)
+    test.assert_eq(vl53l1x.budget_read(d), 33)
+    // A budget the long table has is kept across the change.
+    test.assert(vl53l1x.mode_write(d, Vl53Mode.Vl53Short))
+    test.assert(vl53l1x.budget_write(d, 500))
+    test.assert(vl53l1x.mode_write(d, Vl53Mode.Vl53Long))
+    test.assert_eq(vl53l1x.budget_read(d), 500)
+
+@test
+fn test_a_mode_change_with_an_unknown_budget_sets_100_ms() [io, hw]
+    let c = chip()
+    put16(c, 0x005E, 0x1111)
+    test.assert(vl53l1x.mode_write(dut(c), Vl53Mode.Vl53Short))
+    test.assert_eq(vl53l1x.budget_read(dut(c)), 100)
+
+@test
+fn test_a_mode_change_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    test.assert(vl53l1x.mode_write(dut(c), Vl53Mode.Vl53Short))
+    let n = at(c.st, 1)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(2, k)
+        test.assert(not vl53l1x.mode_write(dut(c2), Vl53Mode.Vl53Short))
+
+// ── The inter-measurement period ─────────────────────────────────────
+
+@test
+fn test_the_period_is_ticks_of_the_oscillator_value_times_1_075() [io, hw]
+    // The oscillator value is bits 9:0 of 0x1234, 564: 100 ms is
+    // 564 * 100 * 1075 / 1000 = 60630 = 0xECD6.
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.intermeasure_write(d, 100))
+    test.assert_eq(at(c.regs, 0x006C), 0x00)
+    test.assert_eq(at(c.regs, 0x006D), 0x00)
+    test.assert_eq(at(c.regs, 0x006E), 0xEC)
+    test.assert_eq(at(c.regs, 0x006F), 0xD6)
+    test.assert_eq(vl53l1x.intermeasure_read(d), 100)
+    // The whole 32-bit register is read: 20 s is more than 16 bits of ticks.
+    test.assert(vl53l1x.intermeasure_write(d, 20000))
+    test.assert_eq(vl53l1x.intermeasure_read(d), 20000)
+
+@test
+fn test_the_period_is_refused_out_of_range_without_an_oscillator_and_on_failures() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(not vl53l1x.intermeasure_write(d, 0))
+    test.assert(not vl53l1x.intermeasure_write(d, 65536))
+    test.assert_eq(at(c.st, 1), 0)
+    put16(c, 0x00DE, 0xFC00)
+    test.assert(not vl53l1x.intermeasure_write(d, 100))
+    test.assert_eq(vl53l1x.intermeasure_read(d), 0)
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert_eq(vl53l1x.intermeasure_read(dut(c2)), 0)
+    test.assert(not vl53l1x.intermeasure_write(dut(c2), 100))
+    let c3 = chip()
+    c3.st.insert(2, 2)
+    test.assert_eq(vl53l1x.intermeasure_read(dut(c3)), 0)
+    let c4 = chip()
+    c4.st.insert(2, 2)
+    test.assert(not vl53l1x.intermeasure_write(dut(c4), 100))
+
+// ── The limits and the thresholds ────────────────────────────────────
+
+@test
+fn test_the_signal_limit_is_the_register_times_eight() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(vl53l1x.signal_limit_read(d), 1024)
+    test.assert(vl53l1x.signal_limit_write(d, 2048))
+    test.assert_eq(at(c.regs, 0x0067), 0x00)
+    test.assert_eq(at(c.regs, 0x0066), 0x01)
+    test.assert_eq(vl53l1x.signal_limit_read(d), 2048)
+    test.assert(vl53l1x.signal_limit_write(d, 0x7FFF8))
+    test.assert_eq(at(c.regs, 0x0066), 0xFF)
+    test.assert(not vl53l1x.signal_limit_write(d, -1))
+    test.assert(not vl53l1x.signal_limit_write(d, 0x7FFF9))
+    c.st.insert(4, 0)
+    test.assert_eq(vl53l1x.signal_limit_read(d), -1)
+
+@test
+fn test_the_sigma_limit_is_fourteen_dot_two_fixed_point_millimetres() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(vl53l1x.sigma_limit_read(d), 90)
+    test.assert(vl53l1x.sigma_limit_write(d, 15))
+    test.assert_eq(at(c.regs, 0x0065), 60)
+    test.assert_eq(vl53l1x.sigma_limit_read(d), 15)
+    test.assert(vl53l1x.sigma_limit_write(d, 0x3FFF))
+    test.assert(not vl53l1x.sigma_limit_write(d, 0x4000))
+    test.assert(not vl53l1x.sigma_limit_write(d, -1))
+    c.st.insert(4, 0)
+    test.assert_eq(vl53l1x.sigma_limit_read(d), -1)
+
+@test
+fn test_the_windows_have_the_codes_of_the_threshold_interrupt() [io, hw]
+    test.assert_eq(vl53l1x.window_code(Vl53Window.WindowBelow), 0)
+    test.assert_eq(vl53l1x.window_code(Vl53Window.WindowAbove), 1)
+    test.assert_eq(vl53l1x.window_code(Vl53Window.WindowOut), 2)
+    test.assert_eq(vl53l1x.window_code(Vl53Window.WindowIn), 3)
+
+@test
+fn test_a_threshold_replaces_new_sample_ready_with_the_window() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.threshold_write(d, 100, 1000, Vl53Window.WindowIn, false))
+    test.assert_eq(at(c.regs, 0x0046), 0x03)
+    test.assert_eq(at(c.regs, 0x0072), 0x03)
+    test.assert_eq(at(c.regs, 0x0073), 0xE8)
+    test.assert_eq(at(c.regs, 0x0074), 0x00)
+    test.assert_eq(at(c.regs, 0x0075), 0x64)
+    test.assert(vl53l1x.threshold_write(d, 100, 1000, Vl53Window.WindowOut, true))
+    test.assert_eq(at(c.regs, 0x0046), 0x42)
+    test.assert(vl53l1x.interrupt_new_sample(d))
+    test.assert_eq(at(c.regs, 0x0046), 0x20)
+
+@test
+fn test_a_threshold_is_refused_out_of_range_and_fails_on_a_failed_transaction() [io, hw]
+    let c = chip()
+    test.assert(not vl53l1x.threshold_write(dut(c), -1, 10, Vl53Window.WindowBelow, false))
+    test.assert(not vl53l1x.threshold_write(dut(c), 70000, 10, Vl53Window.WindowBelow, false))
+    test.assert(not vl53l1x.threshold_write(dut(c), 10, -1, Vl53Window.WindowBelow, false))
+    test.assert(not vl53l1x.threshold_write(dut(c), 10, 70000, Vl53Window.WindowAbove, false))
+    test.assert_eq(at(c.st, 1), 0)
+    for k in 1..4
+        let c2 = chip()
+        c2.st.insert(2, k)
+        test.assert(not vl53l1x.threshold_write(dut(c2), 10, 20, Vl53Window.WindowAbove, false))
+
+// ── The region of interest ───────────────────────────────────────────
+
+@test
+fn test_the_spad_numbers_follow_the_table_of_the_array() [io, hw]
+    // The corners and the centre of Pololu's reproduction of ST's table.
+    test.assert_eq(vl53l1x.spad_of(0, 0), 128)
+    test.assert_eq(vl53l1x.spad_of(15, 0), 248)
+    test.assert_eq(vl53l1x.spad_of(0, 7), 135)
+    test.assert_eq(vl53l1x.spad_of(15, 7), 255)
+    test.assert_eq(vl53l1x.spad_of(0, 8), 127)
+    test.assert_eq(vl53l1x.spad_of(15, 8), 7)
+    test.assert_eq(vl53l1x.spad_of(0, 15), 120)
+    test.assert_eq(vl53l1x.spad_of(15, 15), 0)
+    test.assert_eq(vl53l1x.spad_of(8, 7), 199)
+    test.assert_eq(vl53l1x.spad_of(-1, 0), -1)
+    test.assert_eq(vl53l1x.spad_of(16, 0), -1)
+    test.assert_eq(vl53l1x.spad_of(0, -1), -1)
+    test.assert_eq(vl53l1x.spad_of(0, 16), -1)
+
+@test
+fn test_the_centre_of_the_full_array_is_spad_199() [io, hw]
+    test.assert_eq(vl53l1x.roi_centre_of(0, 0, 16, 16), 199)
+    test.assert_eq(vl53l1x.roi_centre_of(4, 4, 4, 4), vl53l1x.spad_of(6, 5))
+
+@test
+fn test_the_region_is_two_registers_read_and_written_in_one_transaction() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    let r = vl53l1x.roi_read(d)
+    test.assert(r == Some(Vl53Roi { w: 16, h: 16, centre: 199 }))
+    log_is(c, [2, 0x007F, 2, -1])
+    test.assert(vl53l1x.roi_write(d, Vl53Roi { w: 4, h: 4, centre: 0x91 }))
+    log_is(c, [1, 0x007F, 0x91, 0x33, -1])
+    test.assert(vl53l1x.roi_write(d, Vl53Roi { w: 9, h: 13, centre: 100 }))
+    test.assert_eq(at(c.regs, 0x0080), 0xC8)
+    test.assert(vl53l1x.roi_read(d) == Some(Vl53Roi { w: 9, h: 13, centre: 100 }))
+    c.st.insert(4, 0)
+    test.assert(vl53l1x.roi_read(d) == None)
+    test.assert(not vl53l1x.roi_write(d, Vl53Roi { w: 9, h: 13, centre: 100 }))
+
+@test
+fn test_a_region_under_4_by_4_or_over_16_by_16_is_refused() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(not vl53l1x.roi_write(d, Vl53Roi { w: 3, h: 8, centre: 199 }))
+    test.assert(not vl53l1x.roi_write(d, Vl53Roi { w: 17, h: 8, centre: 199 }))
+    test.assert(not vl53l1x.roi_write(d, Vl53Roi { w: 8, h: 3, centre: 199 }))
+    test.assert(not vl53l1x.roi_write(d, Vl53Roi { w: 8, h: 17, centre: 199 }))
+    test.assert(not vl53l1x.roi_write(d, Vl53Roi { w: 8, h: 8, centre: -1 }))
+    test.assert(not vl53l1x.roi_write(d, Vl53Roi { w: 8, h: 8, centre: 256 }))
+    test.assert_eq(at(c.st, 1), 0)
+
+@test
+fn test_a_size_takes_the_optical_centre_and_a_large_one_takes_199() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.roi_size_write(d, 8, 8))
+    test.assert_eq(at(c.regs, 0x007F), 0xA5)
+    test.assert_eq(at(c.regs, 0x0080), 0x77)
+    test.assert(vl53l1x.roi_size_write(d, 10, 10))
+    test.assert_eq(at(c.regs, 0x007F), 0xA5)
+    test.assert(vl53l1x.roi_size_write(d, 11, 4))
+    test.assert_eq(at(c.regs, 0x007F), 199)
+    test.assert_eq(at(c.regs, 0x0080), 0x3A)
+    test.assert(vl53l1x.roi_size_write(d, 4, 11))
+    test.assert_eq(at(c.regs, 0x007F), 199)
+    test.assert(not vl53l1x.roi_size_write(d, 3, 3))
+    c.st.insert(4, 0)
+    test.assert(not vl53l1x.roi_size_write(d, 8, 8))
+
+// ── The result ───────────────────────────────────────────────────────
+
+@test
+fn test_every_raw_status_maps_to_a_range_status_with_or_without_a_distance() [io, hw]
+    test.assert(vl53l1x.status_of_raw(9) == RangeStatus.RangeValid)
+    test.assert(vl53l1x.status_of_raw(6) == RangeStatus.RangeWeak)
+    test.assert(vl53l1x.status_of_raw(4) == RangeStatus.RangeWeak)
+    test.assert(vl53l1x.status_of_raw(5) == RangeStatus.RangeOutOfRange)
+    test.assert(vl53l1x.status_of_raw(7) == RangeStatus.RangeOutOfRange)
+    test.assert(vl53l1x.status_of_raw(8) == RangeStatus.RangeOutOfRange)
+    test.assert(vl53l1x.status_of_raw(1) == RangeStatus.RangeFault)
+    test.assert(vl53l1x.status_of_raw(2) == RangeStatus.RangeFault)
+    test.assert(vl53l1x.status_of_raw(3) == RangeStatus.RangeFault)
+    test.assert(vl53l1x.status_of_raw(17) == RangeStatus.RangeFault)
+    test.assert(vl53l1x.status_of_raw(12) == RangeStatus.RangeNoTarget)
+    test.assert(vl53l1x.status_of_raw(13) == RangeStatus.RangeNoTarget)
+    test.assert(vl53l1x.status_of_raw(18) == RangeStatus.RangeNoTarget)
+    test.assert(vl53l1x.status_of_raw(0) == RangeStatus.RangeNoTarget)
+    let ok = vl53l1x.reading_of(9, 291)
+    test.assert_eq(ok.mm, 291)
+    test.assert(ok.status == RangeStatus.RangeValid)
+    let faint = vl53l1x.reading_of(4, 1500)
+    test.assert_eq(faint.mm, 1500)
+    test.assert(faint.status == RangeStatus.RangeWeak)
+    let far = vl53l1x.reading_of(7, 1500)
+    test.assert_eq(far.mm, 0)
+    test.assert(far.status == RangeStatus.RangeOutOfRange)
+    test.assert_eq(vl53l1x.reading_of(2, 40).mm, 0)
+
+@test
+fn test_the_status_numbers_of_the_ultra_lite_driver() [io, hw]
+    test.assert_eq(vl53l1x.uld_status_of_raw(9), 0)
+    test.assert_eq(vl53l1x.uld_status_of_raw(6), 1)
+    test.assert_eq(vl53l1x.uld_status_of_raw(4), 2)
+    test.assert_eq(vl53l1x.uld_status_of_raw(8), 3)
+    test.assert_eq(vl53l1x.uld_status_of_raw(5), 4)
+    test.assert_eq(vl53l1x.uld_status_of_raw(3), 5)
+    test.assert_eq(vl53l1x.uld_status_of_raw(19), 6)
+    test.assert_eq(vl53l1x.uld_status_of_raw(7), 7)
+    test.assert_eq(vl53l1x.uld_status_of_raw(12), 9)
+    test.assert_eq(vl53l1x.uld_status_of_raw(18), 10)
+    test.assert_eq(vl53l1x.uld_status_of_raw(22), 11)
+    test.assert_eq(vl53l1x.uld_status_of_raw(23), 12)
+    test.assert_eq(vl53l1x.uld_status_of_raw(13), 13)
+    test.assert_eq(vl53l1x.uld_status_of_raw(1), 255)
+
+@test
+fn test_the_result_block_is_read_in_one_transaction_and_decoded() [io, hw]
+    let c = chip()
+    put(c, 0x0089, 0xE9)
+    put(c, 0x008B, 7)
+    let d = dut(c)
+    let r = vl53l1x.result_read(d)
+    log_is(c, [2, 0x0089, 17, -1, 1, 0x0086, 0x01, -1])
+    match r
+        Some(x) =>
+            test.assert_eq(x.raw_status, 9)
+            test.assert_eq(x.stream, 7)
+            test.assert_eq(x.spads, 20)
+            test.assert_eq(x.ambient_kcps, 800)
+            test.assert_eq(x.signal_kcps, 4800)
+            test.assert_eq(x.range_mm, 291)
+        None => test.assert(false)
+
+@test
+fn test_a_result_read_fails_when_the_block_or_the_clear_fails() [io, hw]
+    let c = chip()
+    c.st.insert(2, 1)
+    test.assert(vl53l1x.result_read(dut(c)) == None)
+    let c2 = chip()
+    c2.st.insert(2, 2)
+    test.assert(vl53l1x.result_read(dut(c2)) == None)
+
+@test
+fn test_waiting_for_a_result_gives_up_after_1_1_s() [io, hw]
+    let c = chip()
+    c.st.insert(23, 1)
+    c.st.insert(21, 1)
+    test.assert(vl53l1x.result_wait(dut(c)) == None)
+    test.assert(at(c.st, 0) >= 1100)
+
+@test
+fn test_one_measurement_clears_starts_waits_reads_and_stops() [io, hw]
+    let c = started()
+    let r = vl53l1x.measure(dut(c))
+    match r
+        Some(x) => test.assert_eq(x.range_mm, 291)
+        None => test.assert(false)
+    // clear, start, then the flag, the block, clear and stop.
+    test.assert_eq(at(c.log, 0), 1)
+    test.assert_eq(at(c.log, 1), 0x0086)
+    test.assert_eq(at(c.log, 4), 1)
+    test.assert_eq(at(c.log, 5), 0x0087)
+    test.assert_eq(at(c.log, 6), 0x40)
+    test.assert_eq(at(c.regs, 0x0087), 0x00)
+    test.assert_eq(at(c.st, 24), 0)
+
+@test
+fn test_a_measurement_that_never_finishes_is_stopped_and_answers_nothing() [io, hw]
+    let c = started()
+    c.st.insert(21, 1)
+    test.assert(vl53l1x.measure(dut(c)) == None)
+    test.assert_eq(at(c.st, 24), 0)
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert(vl53l1x.measure(dut(c2)) == None)
+
+// ── The rangefinder ──────────────────────────────────────────────────
+
+@test
+fn test_range_start_answers_the_budget_or_zero_while_continuous() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert_eq(vl53l1x.range_start_of(d, Vl53State { continuous: false }), 100000)
+    test.assert_eq(at(c.st, 24), 1)
+    log_clear(c)
+    test.assert_eq(vl53l1x.range_start_of(d, Vl53State { continuous: true }), 0)
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_range_start_answers_the_longest_budget_for_a_budget_it_does_not_know() [io, hw]
+    let c = started()
+    put16(c, 0x005E, 0x1111)
+    test.assert_eq(vl53l1x.range_start_of(dut(c), Vl53State { continuous: false }), 500000)
+
+@test
+fn test_range_start_answers_minus_one_when_a_transaction_fails() [io, hw]
+    for k in 1..3
+        let c = started()
+        c.st.insert(2, k)
+        test.assert_eq(vl53l1x.range_start_of(dut(c), Vl53State { continuous: false }), -1)
+
+@test
+fn test_range_read_waits_reads_and_stops_a_single_measurement() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert(vl53l1x.range_start_of(d, Vl53State { continuous: false }) > 0)
+    let r = vl53l1x.range_read_of(d, Vl53State { continuous: false })
+    test.assert_eq(mm_of(r), 291)
+    test.assert(status_of(r) == RangeStatus.RangeValid)
+    test.assert_eq(at(c.st, 24), 0)
+
+@test
+fn test_range_read_leaves_continuous_ranging_running() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert(vl53l1x.ranging_start(d))
+    let r = vl53l1x.range_read_of(d, Vl53State { continuous: true })
+    test.assert_eq(mm_of(r), 291)
+    test.assert_eq(at(c.st, 24), 1)
+    // The next result is pending again after the clear.
+    test.assert_eq(at(c.st, 23), 1)
+
+@test
+fn test_range_read_reports_the_status_of_a_target_it_cannot_measure() [io, hw]
+    let c = started()
+    put(c, 0x0089, 7)
+    let d = dut(c)
+    test.assert(vl53l1x.range_start_of(d, Vl53State { continuous: false }) > 0)
+    let r = vl53l1x.range_read_of(d, Vl53State { continuous: false })
+    test.assert_eq(mm_of(r), 0)
+    test.assert(status_of(r) == RangeStatus.RangeOutOfRange)
+
+@test
+fn test_range_read_answers_nothing_when_no_result_comes_and_still_stops() [io, hw]
+    let c = started()
+    c.st.insert(21, 1)
+    let d = dut(c)
+    test.assert(vl53l1x.range_start_of(d, Vl53State { continuous: false }) > 0)
+    test.assert(vl53l1x.range_read_of(d, Vl53State { continuous: false }) == None)
+    test.assert_eq(at(c.st, 24), 0)
+
+@test
+fn test_the_longest_distance_follows_the_mode() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(vl53l1x.max_mm_of(d), 3600)
+    put(c, 0x004B, 0x14)
+    test.assert_eq(vl53l1x.max_mm_of(d), 1360)
+    put(c, 0x004B, 0x00)
+    test.assert_eq(vl53l1x.max_mm_of(d), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(vl53l1x.max_mm_of(d), 0)
+
+// ── The zones ────────────────────────────────────────────────────────
+
+// The centre SPAD of every region write to 0x7F in the log, in order.
+fn roi_centres(c: Chip) -> [Int]
+    var out: [Int] = []
+    let n = at(c.st, 99)
+    for i in 0..n
+        if at(c.log, i) == 1 and at(c.log, i + 1) == 0x007F
+            list.push(out, at(c.log, i + 2))
+    out
+
+@test
+fn test_a_scan_measures_16_regions_of_4_by_4_row_by_row() [io, hw]
+    let c = started()
+    var out: Vec[RangeReading; 64] = Vec.new()
+    test.assert(vl53l1x.zones_scan(dut(c), var out))
+    test.assert_eq(out.len(), 16)
+    for i in 0..16
+        test.assert_eq(out[i].mm, 291)
+        test.assert(out[i].status == RangeStatus.RangeValid)
+    // The centres: column 4 col + 2, row 4 row + 1 of the table of the array,
+    // then the region the part had put back (centre 199, 16 by 16).
+    let want = [145, 177, 209, 241, 149, 181, 213, 245, 110, 78, 46, 14, 106, 74, 42, 10, 199]
+    let got = roi_centres(c)
+    test.assert_eq(got.len(), 17)
+    for i in 0..17
+        test.assert_eq(got[i], want[i])
+    test.assert_eq(at(c.regs, 0x007F), 199)
+    test.assert_eq(at(c.regs, 0x0080), 0xFF)
+    test.assert_eq(at(c.st, 24), 0)
+
+@test
+fn test_a_scan_that_cannot_measure_leaves_nothing_and_puts_the_region_back() [io, hw]
+    let c = started()
+    c.st.insert(21, 1)
+    var out: Vec[RangeReading; 64] = Vec.new()
+    let _ = out.push(RangeReading { mm: 1, status: RangeStatus.RangeValid })
+    test.assert(not vl53l1x.zones_scan(dut(c), var out))
+    test.assert_eq(out.len(), 0)
+    test.assert_eq(at(c.regs, 0x007F), 199)
+    test.assert_eq(at(c.regs, 0x0080), 0xFF)
+
+@test
+fn test_a_scan_fails_on_any_one_failed_transaction_with_nothing_in_the_output() [io, hw]
+    let c = started()
+    var good: Vec[RangeReading; 64] = Vec.new()
+    test.assert(vl53l1x.zones_scan(dut(c), var good))
+    let n = at(c.st, 1)
+    // A failed stop is not a failed scan (the result was read), nor is a poll
+    // the part did not answer.  Every other transaction fails the scan, and the
+    // output is empty.
+    var failed = 0
+    for k in 1..(n + 1)
+        let c2 = started()
+        c2.st.insert(2, k)
+        var out: Vec[RangeReading; 64] = Vec.new()
+        if not vl53l1x.zones_scan(dut(c2), var out)
+            failed = failed + 1
+            test.assert_eq(out.len(), 0)
+    test.assert_eq(failed, n - 16 - polls_in(c))
+
+@test
+fn test_the_zone_trait_answers_the_grid_side_and_the_scan_time() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert_eq(vl53l1x.zones_start_of(d, Vl53State { continuous: false }), 1600000)
+    test.assert_eq(vl53l1x.zones_start_of(d, Vl53State { continuous: true }), -1)
+    c.st.insert(4, 0)
+    test.assert_eq(vl53l1x.zones_start_of(d, Vl53State { continuous: false }), -1)
+
+@test
+fn test_a_scan_is_refused_while_the_part_ranges_continuously() [io, hw]
+    let c = started()
+    var out: Vec[RangeReading; 64] = Vec.new()
+    let _ = out.push(RangeReading { mm: 1, status: RangeStatus.RangeValid })
+    test.assert(not vl53l1x.zones_read_of(dut(c), Vl53State { continuous: true }, var out))
+    test.assert_eq(out.len(), 0)
+    test.assert_eq(at(c.st, 99), 0)
+    test.assert(vl53l1x.zones_read_of(dut(c), Vl53State { continuous: false }, var out))
+    test.assert_eq(out.len(), 16)
+
+// ── The calibrations ─────────────────────────────────────────────────
+
+@test
+fn test_the_offset_has_two_fraction_bits_in_13_bits_two_s_complement() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.offset_write(d, -5))
+    test.assert_eq(at(c.regs, 0x001E), 0xFF)
+    test.assert_eq(at(c.regs, 0x001F), 0xEC)
+    test.assert_eq(at(c.regs, 0x0020), 0)
+    test.assert_eq(at(c.regs, 0x0023), 0)
+    test.assert(vl53l1x.offset_read(d) == Some(-5))
+    test.assert(vl53l1x.offset_write(d, 7))
+    test.assert_eq(at(c.regs, 0x001F), 0x1C)
+    test.assert(vl53l1x.offset_read(d) == Some(7))
+    test.assert(not vl53l1x.offset_write(d, 1024))
+    test.assert(not vl53l1x.offset_write(d, -1025))
+    test.assert(vl53l1x.offset_write(d, 1023))
+    test.assert(vl53l1x.offset_write(d, -1024))
+    c.st.insert(4, 0)
+    test.assert(vl53l1x.offset_read(d) == None)
+    test.assert(not vl53l1x.offset_write(d, 7))
+
+@test
+fn test_a_fractional_offset_reads_toward_zero_as_c_divides() [io, hw]
+    let c = chip()
+    put16(c, 0x001E, 0x1FF9)
+    test.assert(vl53l1x.offset_read(dut(c)) == Some(-1))
+    put16(c, 0x001E, 0x1FFD)
+    test.assert(vl53l1x.offset_read(dut(c)) == Some(0))
+    put16(c, 0x001E, 0x0007)
+    test.assert(vl53l1x.offset_read(dut(c)) == Some(1))
+    test.assert_eq(vl53l1x.div_trunc(-7, 4), -1)
+    test.assert_eq(vl53l1x.div_trunc(7, 4), 1)
+
+@test
+fn test_the_crosstalk_is_kilocounts_in_7_9_fixed_point() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.xtalk_write(d, 5000))
+    test.assert_eq(at(c.regs, 0x0016), 0x0A)
+    test.assert_eq(at(c.regs, 0x0017), 0x00)
+    test.assert_eq(at(c.regs, 0x0018), 0)
+    test.assert_eq(at(c.regs, 0x001B), 0)
+    test.assert(vl53l1x.xtalk_read(d) == Some(5000))
+    test.assert(vl53l1x.xtalk_write(d, 127998))
+    test.assert_eq(at(c.regs, 0x0016), 0xFF)
+    test.assert(not vl53l1x.xtalk_write(d, 127999))
+    test.assert(not vl53l1x.xtalk_write(d, -1))
+    c.st.insert(4, 0)
+    test.assert(vl53l1x.xtalk_read(d) == None)
+    test.assert(not vl53l1x.xtalk_write(d, 5))
+
+@test
+fn test_the_sums_count_only_results_that_carry_a_distance() [io, hw]
+    let c = started()
+    match vl53l1x.sums_run(dut(c), 3)
+        Some(s) =>
+            test.assert_eq(s.got, 3)
+            test.assert_eq(s.dist, 873)
+            test.assert_eq(s.signal, 14400)
+            test.assert_eq(s.spads, 60)
+        None => test.assert(false)
+    test.assert_eq(at(c.st, 24), 0)
+    let c2 = started()
+    c2.st.insert(40, 1)
+    match vl53l1x.sums_run(dut(c2), 4)
+        Some(s) => test.assert_eq(s.got, 2)
+        None => test.assert(false)
+
+@test
+fn test_the_sums_are_nothing_without_a_distance_or_a_result_or_a_start() [io, hw]
+    let c = started()
+    put(c, 0x0089, 12)
+    test.assert(vl53l1x.sums_run(dut(c), 3) == None)
+    test.assert_eq(at(c.st, 24), 0)
+    let c2 = started()
+    c2.st.insert(21, 1)
+    test.assert(vl53l1x.sums_run(dut(c2), 3) == None)
+    test.assert_eq(at(c2.st, 24), 0)
+    let c3 = started()
+    c3.st.insert(2, 1)
+    test.assert(vl53l1x.sums_run(dut(c3), 3) == None)
+
+@test
+fn test_the_offset_calibration_sets_the_target_less_the_average() [io, hw]
+    // The part reads 291 mm of a target at 140 mm: the offset is -151.
+    let c = started()
+    let d = dut(c)
+    test.assert(vl53l1x.calibrate_offset(d, 140) == Some(-151))
+    test.assert(vl53l1x.offset_read(d) == Some(-151))
+    let c2 = started()
+    test.assert(vl53l1x.calibrate_offset(dut(c2), 300) == Some(9))
+    test.assert_eq(at(c2.regs, 0x001F), 36)
+
+@test
+fn test_the_offset_calibration_fails_without_results_or_on_a_failed_write() [io, hw]
+    let c = started()
+    c.st.insert(21, 1)
+    test.assert(vl53l1x.calibrate_offset(dut(c), 140) == None)
+    let c2 = started()
+    c2.st.insert(2, 1)
+    test.assert(vl53l1x.calibrate_offset(dut(c2), 140) == None)
+    // The last transaction of a good run is the write that sets the offset.
+    let c3 = started()
+    test.assert(vl53l1x.calibrate_offset(dut(c3), 140) != None)
+    let n = at(c3.st, 1)
+    let c4 = started()
+    c4.st.insert(2, n)
+    test.assert(vl53l1x.calibrate_offset(dut(c4), 140) == None)
+
+@test
+fn test_the_crosstalk_calibration_follows_the_ultra_lite_formula() [io, hw]
+    // 50 results of 300 mm, signal 80 kcps (raw 10), 20 SPADs, a target at
+    // 600 mm: 512 * (50 * 80) * (50 * 600 - 50 * 300) / (50 * 600 * 50 * 20) = 1024,
+    // which is 2000 counts a second.
+    let c = started()
+    put16(c, 0x0096, 300)
+    put16(c, 0x0098, 10)
+    test.assert(vl53l1x.calibrate_xtalk(dut(c), 600) == Some(2000))
+    test.assert_eq(at(c.regs, 0x0016), 0x04)
+    test.assert_eq(at(c.regs, 0x0017), 0x00)
+
+@test
+fn test_a_target_nearer_than_the_average_gives_no_crosstalk() [io, hw]
+    let c = started()
+    put16(c, 0x0096, 700)
+    put16(c, 0x0098, 10)
+    test.assert(vl53l1x.calibrate_xtalk(dut(c), 600) == Some(0))
+
+@test
+fn test_a_very_strong_signal_clips_the_crosstalk_to_the_register() [io, hw]
+    let c = started()
+    put16(c, 0x0096, 0)
+    put16(c, 0x0098, 0xFFFF)
+    test.assert(vl53l1x.calibrate_xtalk(dut(c), 600) == Some(127998))
+    test.assert_eq(at(c.regs, 0x0016), 0xFF)
+
+@test
+fn test_the_crosstalk_calibration_fails_for_bad_input_and_failed_transactions() [io, hw]
+    let c = started()
+    test.assert(vl53l1x.calibrate_xtalk(dut(c), 0) == None)
+    test.assert(vl53l1x.calibrate_xtalk(dut(c), -5) == None)
+    let c2 = started()
+    put16(c2, 0x008C, 0)
+    test.assert(vl53l1x.calibrate_xtalk(dut(c2), 600) == None)
+    let c3 = started()
+    c3.st.insert(2, 1)
+    test.assert(vl53l1x.calibrate_xtalk(dut(c3), 600) == None)
+    let c4 = started()
+    c4.st.insert(21, 1)
+    test.assert(vl53l1x.calibrate_xtalk(dut(c4), 600) == None)
+    let c5 = started()
+    put16(c5, 0x0096, 300)
+    put16(c5, 0x0098, 10)
+    test.assert(vl53l1x.calibrate_xtalk(dut(c5), 600) != None)
+    let n = at(c5.st, 1)
+    let c6 = started()
+    put16(c6, 0x0096, 300)
+    put16(c6, 0x0098, 10)
+    c6.st.insert(2, n)
+    test.assert(vl53l1x.calibrate_xtalk(dut(c6), 600) == None)
+
+// ── The types and the helpers that carry the state ───────────────────
+
+@test
+fn test_the_state_helpers() [io, hw]
+    let d = Vl53l1x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert(not d.st.continuous)
+    let on = vl53l1x.with_continuous(d, true, true)
+    test.assert(on.st.continuous)
+    let still = vl53l1x.with_continuous(d, false, true)
+    test.assert(not still.st.continuous)
+    let off = vl53l1x.with_continuous(on, true, false)
+    test.assert(not off.st.continuous)
+    let moved = vl53l1x.with_addr(on, true, 0x30)
+    test.assert(moved.w.addr == Some(0x30))
+    test.assert(moved.w.irq == Some(7))
+    test.assert(moved.w.en == Some(8))
+    test.assert(moved.st.continuous)
+    let stayed = vl53l1x.with_addr(d, false, 0x30)
+    test.assert(stayed.w.addr == Some(0x29))
+
+@test
+fn test_moving_the_address_writes_0x0001_and_the_part_answers_there() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l1x.wr(d, 0x0001, 0x30))
+    test.assert_eq(at(c.st, 30), 0x30)
+    test.assert(vl53l1x.rd(d, 0x010F) == None)
+    let moved = Dut { bus: FakeI2c { c: c }, pins: pins(c), c: c, w: dev_bus.wiring_i2c(0, 0x30) }
+    test.assert(vl53l1x.model_ok(moved))
+
+// ── The type over the host's board handles ───────────────────────────
+//
+// The host's I2C bus is absent hardware: every transfer is refused, so each
+// method answers its "no part" value.  This runs the lines of the type that
+// forward to the functions above.
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw]
+    var p = Vl53l1x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert(not p.begin())
+    test.assert(not p.begin_io(false))
+    test.assert(p.mode() == None)
+    test.assert(not p.set_mode(Vl53Mode.Vl53Long))
+    test.assert_eq(p.budget_ms(), 0)
+    test.assert(not p.set_budget_ms(50))
+    test.assert_eq(p.intermeasure_ms(), 0)
+    test.assert(not p.set_intermeasure_ms(100))
+    test.assert(not p.continuous_begin())
+    test.assert(not p.continuous_end())
+    test.assert(p.measure_now() == None)
+    test.assert(p.result_now() == None)
+    test.assert(not p.data_ready())
+    test.assert(not p.set_interrupt_high(true))
+    test.assert(p.interrupt_high() == None)
+    test.assert_eq(p.gpio1_level(), 0)
+    test.assert(p.roi() == None)
+    test.assert(not p.set_roi_size(8, 8))
+    test.assert(not p.set_roi(Vl53Roi { w: 8, h: 8, centre: 199 }))
+    test.assert(p.offset_mm() == None)
+    test.assert(not p.set_offset_mm(3))
+    test.assert(p.xtalk_cps() == None)
+    test.assert(not p.set_xtalk_cps(3))
+    test.assert(p.calibrate_offset(140) == None)
+    test.assert(p.calibrate_xtalk(600) == None)
+    test.assert(not p.temperature_update())
+    test.assert_eq(p.signal_limit_kcps(), -1)
+    test.assert(not p.set_signal_limit_kcps(1024))
+    test.assert_eq(p.sigma_limit_mm(), -1)
+    test.assert(not p.set_sigma_limit_mm(15))
+    test.assert(not p.set_threshold(10, 20, Vl53Window.WindowIn, false))
+    test.assert(not p.set_interrupt_new_sample())
+    test.assert(not p.move_to(0x30))
+    test.assert(p.reg(0x010F) == None)
+    test.assert_eq(p.range_start(), -1)
+    test.assert(p.range_read() == None)
+    test.assert_eq(p.range_max_mm(), 0)
+    test.assert(p.device_id() == None)
+    test.assert(p.range_read_after(10, 20) == None)
+    test.assert_eq(p.zones_side(), 4)
+    test.assert_eq(p.zones_start(), -1)
+    var out: Vec[RangeReading; 64] = Vec.new()
+    test.assert(not p.zones_read(var out))
+
+@test
+fn test_the_type_without_pins_over_absent_hardware() [io, hw]
+    var p = Vl53l1x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring_plain())
+    test.assert(not p.begin())
+    test.assert_eq(p.gpio1_level(), -1)
+
+@test
+fn test_the_type_while_continuous_over_absent_hardware() [io, hw]
+    let d = vl53l1x.with_continuous(Vl53l1x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring()), true, true)
+    test.assert_eq(d.range_start(), 0)
+    test.assert_eq(d.zones_start(), -1)
+    var out: Vec[RangeReading; 64] = Vec.new()
+    test.assert(not d.zones_read(var out))
+
+// A function written against the trait alone, called on a `let`.
+fn distance_of<R: Rangefinder>(r: R) -> ?RangeReading [hw]
+    if r.range_start() < 0
+        return None
+    r.range_read()
+
+@test
+fn test_a_function_over_the_trait_reads_the_sensor_through_a_plain_parameter() [io, hw]
+    let p = Vl53l1x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert(distance_of(p) == None)
