@@ -27,15 +27,16 @@ ranging sensor on an I2C bus.
   interrupt, the interrupt polarity, the temperature update, XSHUT and the
   change of the I2C address.
 - The device program `examples/range_reader.nv`, a distance reader with a zone
-  map. Built for the nRF52840-DK it is 16,888 B of flash and for the
-  nRF54LM20-DK 18,152 B.
+  map. Built for the nRF52840-DK it is 26,920 B of flash and for the
+  nRF54LM20-DK 28,360 B; before the Nordic buses landed, with the reading path
+  left out, it was 16,888 B and 18,152 B.
 
 ### Known
 
 - Hardware verification: NOT VERIFIED. No board on the bench carries the
-  sensor. Neither Nordic board has a driver for its two-wire interface (TWIM)
-  at this release, so the device program builds for them and finds an absent
-  bus.
+  sensor. The nRF52840 DK drives I2C with TWIM0 and the nRF54LM20 DK with
+  TWIM22, so the device program's images carry the reading path; a reply from
+  the sensor over either bus is NOT VERIFIED.
 - ST publishes no register map. The register list, the default configuration
   and the sequences are those of ST's ultra-lite driver as the
   stm32duino/VL53L1X copy of it carries them; the range status is mapped from
