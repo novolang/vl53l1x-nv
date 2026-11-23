@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 — 2026-11-23
+
+The package asks for embedded-hal-nv ^0.4.0 (was ^0.3.2) and devices-nv ^0.4.0 (was ^0.3.3), the minor of both trait packages that the other drivers and the board packages ask for, so one version of each serves a program that takes this package beside any of them.  Under the older ranges, a program that named this package and a driver on 0.4 stopped with "no version of 'embedded-hal-nv' satisfies every requirement".
+
+No signature of the package changed.  `examples/range_reader.nv` adds the `RangeBlinded` and `RangeSaturated` arms that devices-nv 0.4.0 gives `RangeStatus`.
+
+The device program builds for the boards its README names, flash nrf52840-dk 22,432 B before and 22,384 B after; nrf54lm20-dk 23,928 B before and 23,880 B after; nrf52-qemu 11,848 B before and 11,848 B after.
+
 ## 0.1.0
 
 The first release: a driver for ST's VL53L1X long-distance time-of-flight
