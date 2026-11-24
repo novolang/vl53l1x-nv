@@ -25,7 +25,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_range.{ RangeReading, RangeStatus, Rangefinder, RangefinderZones }
 use dev_id.{ DeviceId, Identifiable }
 use vl53l1x
@@ -215,15 +215,21 @@ struct Dut
     c: Chip
     w: DeviceWiring
 
-impl Vl53l1xPort for Dut
-    fn setup(self) -> Bool [hw]
-        vl53l1x.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for Dut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         vl53l1x.i2c_read_into(self.bus, self.w, reg, n, var dst)
 
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        var src: DevBytes = Vec.new()
+        let _ = src.push((v & 0xFF) as u8)
+        vl53l1x.i2c_write_from(self.bus, self.w, reg, src)
+
     fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
         vl53l1x.i2c_write_from(self.bus, self.w, reg, src)
+
+impl Vl53l1xPort for Dut
+    fn setup(self) -> Bool [hw]
+        vl53l1x.i2c_setup(self.bus, self.pins, self.w)
 
     fn now_ms(self) -> Int [hw]
         at(self.c.st, 0)
@@ -297,9 +303,9 @@ fn test_a_register_read_sends_the_address_high_byte_first() [io, hw]
     put16(c, 0x0124, 0xABCD)
     put16(c, 0x0126, 0x1234)
     let d = dut(c)
-    test.assert(vl53l1x.rd(d, 0x0123) == Some(0x77))
+    test.assert(d.read_reg(0x0123) == Some(0x77))
     log_is(c, [2, 0x0123, 1, -1])
-    test.assert(vl53l1x.rd16(d, 0x0124) == Some(0xABCD))
+    test.assert(d.read_reg16_be(0x0124) == Some(0xABCD))
     log_is(c, [2, 0x0124, 2, -1])
     test.assert(vl53l1x.rd32(d, 0x0124) == Some(0xABCD1234))
     log_is(c, [2, 0x0124, 4, -1])
@@ -308,9 +314,9 @@ fn test_a_register_read_sends_the_address_high_byte_first() [io, hw]
 fn test_a_register_write_sends_the_address_then_the_value_most_significant_byte_first() [io, hw]
     let c = chip()
     let d = dut(c)
-    test.assert(vl53l1x.wr(d, 0x0200, 0x1AB))
+    test.assert(d.write_reg(0x0200, 0x1AB))
     log_is(c, [1, 0x0200, 0xAB, -1])
-    test.assert(vl53l1x.wr16(d, 0x0210, 0xA1B2))
+    test.assert(d.write_reg16_be(0x0210, 0xA1B2))
     log_is(c, [1, 0x0210, 0xA1, 0xB2, -1])
     test.assert(vl53l1x.wr32(d, 0x0220, 0x01020304))
     log_is(c, [1, 0x0220, 0x01, 0x02, 0x03, 0x04, -1])
@@ -321,22 +327,22 @@ fn test_update_changes_only_the_bits_of_the_mask() [io, hw]
     let c = chip()
     put(c, 0x0300, 0b10100101)
     let d = dut(c)
-    test.assert(vl53l1x.upd(d, 0x0300, 0b00001111, 0b00000011))
+    test.assert(d.update_reg(0x0300, 0b00001111, 0b00000011))
     test.assert_eq(at(c.regs, 0x0300), 0b10100011)
     log_is(c, [2, 0x0300, 1, -1, 1, 0x0300, 0b10100011, -1])
     c.st.insert(4, 0)
-    test.assert(not vl53l1x.upd(d, 0x0300, 0xFF, 0))
+    test.assert(not d.update_reg(0x0300, 0xFF, 0))
 
 @test
 fn test_a_failed_read_or_write_answers_nothing_or_false() [io, hw]
     let c = chip()
     let d = dut(c)
     c.st.insert(4, 0)
-    test.assert(vl53l1x.rd(d, 0x0123) == None)
-    test.assert(vl53l1x.rd16(d, 0x0123) == None)
+    test.assert(d.read_reg(0x0123) == None)
+    test.assert(d.read_reg16_be(0x0123) == None)
     test.assert(vl53l1x.rd32(d, 0x0123) == None)
-    test.assert(not vl53l1x.wr(d, 0x0123, 1))
-    test.assert(not vl53l1x.wr16(d, 0x0123, 1))
+    test.assert(not d.write_reg(0x0123, 1))
+    test.assert(not d.write_reg16_be(0x0123, 1))
     test.assert(not vl53l1x.wr32(d, 0x0123, 1))
 
 @test
@@ -1443,9 +1449,9 @@ fn test_the_state_helpers() [io, hw]
 fn test_moving_the_address_writes_0x0001_and_the_part_answers_there() [io, hw]
     let c = chip()
     let d = dut(c)
-    test.assert(vl53l1x.wr(d, 0x0001, 0x30))
+    test.assert(d.write_reg(0x0001, 0x30))
     test.assert_eq(at(c.st, 30), 0x30)
-    test.assert(vl53l1x.rd(d, 0x010F) == None)
+    test.assert(d.read_reg(0x010F) == None)
     let moved = Dut { bus: FakeI2c { c: c }, pins: pins(c), c: c, w: dev_bus.wiring_i2c(0, 0x30) }
     test.assert(vl53l1x.model_ok(moved))
 
@@ -1528,3 +1534,15 @@ fn distance_of<R: Rangefinder>(r: R) -> ?RangeReading [hw]
 fn test_a_function_over_the_trait_reads_the_sensor_through_a_plain_parameter() [io, hw]
     let p = Vl53l1x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
     test.assert(distance_of(p) == None)
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(vl53l1x.rd(d, 0x0123), d.read_reg(0x0123))
+    test.assert_eq(vl53l1x.rd16(d, 0x0123), d.read_reg16_be(0x0123))
+    test.assert_eq(vl53l1x.wr(d, 0x0123, 0x01), d.write_reg(0x0123, 0x01))
+    test.assert_eq(vl53l1x.wr16(d, 0x0123, 0x1234), d.write_reg16_be(0x0123, 0x1234))
+    test.assert_eq(vl53l1x.upd(d, 0x0123, 0x0F, 0x01), d.update_reg(0x0123, 0x0F, 0x01))

@@ -295,7 +295,7 @@ a second in 7.9 fixed point, shown in counts a second.
 
 | Module | What is in it |
 |---|---|
-| `vl53l1x` | The type `Vl53l1x` that holds a board's bus, timer and pins, the trait `Vl53l1xPort`, the bring-up as named functions, the tables of the timing budget, the modes, the region and zones, the calibrations, the thresholds, the measurements and the range status |
+| `vl53l1x` | The type `Vl53l1x` that holds a board's bus, timer and pins, the trait `Vl53l1xPort` over devices-nv's `RegPort`, the bring-up as named functions, the tables of the timing budget, the modes, the region and zones, the calibrations, the thresholds, the measurements and the range status |
 
 ## How to choose an entry point
 
@@ -331,7 +331,7 @@ address, replace the state it holds.
 | `reg(r)` | one register |
 
 A program that holds its own bus, or a test with a double of the part,
-implements `Vl53l1xPort` over its bus and calls the module's functions, which
+implements devices-nv's `RegPort` (`read_regs` and `write_reg`; the register reads and read-modify-writes, `port.read_reg(reg)` and `port.update_reg_verified(reg, mask, bits)`, are its methods) and `Vl53l1xPort` over its bus and calls the module's functions, which
 take the port: `vl53l1x.start(port, true)`, `vl53l1x.measure(port)`. The
 framing is `i2c_read_into` and `i2c_write_from`, generic over `I2cBus`.
 

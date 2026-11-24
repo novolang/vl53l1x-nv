@@ -103,7 +103,7 @@
 //     ultra-lite driver does.
 
 use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut, Timer }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_range.{ RangeReading, RangeStatus, Rangefinder, RangefinderZones }
 use dev_id.{ DeviceId, Identifiable }
 
@@ -275,14 +275,14 @@ struct Vl53Sums
     signal: Int
     spads: Int
 
-// A bus the part is on: `setup` makes it ready, `read_regs` and `write_regs`
-// move bytes from and to consecutive registers (16-bit addresses) in one
-// transaction, `now_ms` and `wait_ms` are the clock, `irq_level` is the level
+// A bus the part is on. `RegPort` is the register access, `read_regs`,
+// `write_reg` and `write_regs`, with the register reads and writes built
+// on them (the register numbers are 16-bit addresses, and `write_regs`
+// moves bytes to consecutive registers in one transaction); `setup` makes
+// it ready, `now_ms` and `wait_ms` are the clock, `irq_level` is the level
 // of GPIO1 and `xshut` drives the shutdown pin.
-pub trait Vl53l1xPort
+pub trait Vl53l1xPort: RegPort
     fn setup(self) -> Bool [hw]
-    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
-    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
     fn now_ms(self) -> Int [hw]
     fn wait_ms(self, ms: Int) [hw]
     fn irq_level(self) -> Int [hw]
@@ -312,9 +312,9 @@ pub fn i2c_setup<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Boo
     w.addr != None
 
 // The level of GPIO1 on the board, or -1 for a wiring with no interrupt pin.
-pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
-    let Some(irq) = w.irq else return -1
-    gpio.get(irq)
+pub @deprecated(since = "0.2.0", replace_with = "dev_bus.wiring_irq_level")
+fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    dev_bus.wiring_irq_level(gpio, w)
 
 // Drives the shutdown pin: whether the wiring has one.
 pub fn xshut_of<G: GpioOut>(gpio: G, w: DeviceWiring, level: Int) -> Bool [hw]
@@ -325,18 +325,14 @@ pub fn xshut_of<G: GpioOut>(gpio: G, w: DeviceWiring, level: Int) -> Bool [hw]
 // ── Register access ──────────────────────────────────────────────────
 
 // One register, or `None` when the part did not answer.
-pub fn rd<P: Vl53l1xPort>(p: P, reg: Int) -> ?Int [hw]
-    var b: DevBytes = Vec.new()
-    if not p.read_regs(reg, 1, var b)
-        return None
-    Some(b[0] as Int)
+pub @deprecated(since = "0.2.0", replace_with = "RegPort.read_reg")
+fn rd<P: Vl53l1xPort>(p: P, reg: Int) -> ?Int [hw]
+    p.read_reg(reg)
 
 // A 16-bit value, most significant byte first.
-pub fn rd16<P: Vl53l1xPort>(p: P, reg: Int) -> ?Int [hw]
-    var b: DevBytes = Vec.new()
-    if not p.read_regs(reg, 2, var b)
-        return None
-    Some((b[0] as Int << 8) | b[1] as Int)
+pub @deprecated(since = "0.2.0", replace_with = "RegPort.read_reg16_be")
+fn rd16<P: Vl53l1xPort>(p: P, reg: Int) -> ?Int [hw]
+    p.read_reg16_be(reg)
 
 // A 32-bit value, most significant byte first.
 pub fn rd32<P: Vl53l1xPort>(p: P, reg: Int) -> ?Int [hw]
@@ -346,17 +342,14 @@ pub fn rd32<P: Vl53l1xPort>(p: P, reg: Int) -> ?Int [hw]
     Some((b[0] as Int << 24) | (b[1] as Int << 16) | (b[2] as Int << 8) | b[3] as Int)
 
 // Writes one register: whether the part acknowledged.
-pub fn wr<P: Vl53l1xPort>(p: P, reg: Int, v: Int) -> Bool [hw]
-    var src: DevBytes = Vec.new()
-    let _ = src.push((v & 0xFF) as u8)
-    p.write_regs(reg, src)
+pub @deprecated(since = "0.2.0", replace_with = "RegPort.write_reg")
+fn wr<P: Vl53l1xPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    p.write_reg(reg, v)
 
 // Writes a 16-bit value, most significant byte first.
-pub fn wr16<P: Vl53l1xPort>(p: P, reg: Int, v: Int) -> Bool [hw]
-    var src: DevBytes = Vec.new()
-    let _ = src.push(((v >> 8) & 0xFF) as u8)
-    let _ = src.push((v & 0xFF) as u8)
-    p.write_regs(reg, src)
+pub @deprecated(since = "0.2.0", replace_with = "RegPort.write_reg16_be")
+fn wr16<P: Vl53l1xPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    p.write_reg16_be(reg, v)
 
 // Writes a 32-bit value, most significant byte first.
 pub fn wr32<P: Vl53l1xPort>(p: P, reg: Int, v: Int) -> Bool [hw]
@@ -368,9 +361,9 @@ pub fn wr32<P: Vl53l1xPort>(p: P, reg: Int, v: Int) -> Bool [hw]
     p.write_regs(reg, src)
 
 // Sets the bits of `mask` in `reg` to `bits`, leaving the others.
-pub fn upd<P: Vl53l1xPort>(p: P, reg: Int, mask: Int, bits: Int) -> Bool [hw]
-    let Some(old) = rd(p, reg) else return false
-    wr(p, reg, (old & (0xFF ^ mask)) | (bits & mask))
+pub @deprecated(since = "0.2.0", replace_with = "RegPort.update_reg")
+fn upd<P: Vl53l1xPort>(p: P, reg: Int, mask: Int, bits: Int) -> Bool [hw]
+    p.update_reg(reg, mask, bits)
 
 // ── Identity and boot ────────────────────────────────────────────────
 
@@ -395,7 +388,7 @@ pub fn model_ok<P: Vl53l1xPort>(p: P) -> Bool [hw]
 pub fn boot_wait<P: Vl53l1xPort>(p: P) -> Bool [hw]
     let start = p.now_ms()
     loop
-        let Some(v) = rd(p, REG_BOOT) else return false
+        let Some(v) = p.read_reg(REG_BOOT) else return false
         if v != 0
             return true
         if p.now_ms() - start >= BOOT_WAIT_MS
@@ -440,20 +433,20 @@ pub fn ready_wait<P: Vl53l1xPort>(p: P, timeout_ms: Int) -> Bool [hw]
 
 // Clears the interrupt, which lets the next ranging update the result.
 pub fn interrupt_clear<P: Vl53l1xPort>(p: P) -> Bool [hw]
-    wr(p, REG_INT_CLEAR, 0x01)
+    p.write_reg(REG_INT_CLEAR, 0x01)
 
 // Starts autonomous ranging (SYSTEM__MODE_START = 0x40): whether the part
 // acknowledged.
 pub fn ranging_start<P: Vl53l1xPort>(p: P) -> Bool [hw]
-    wr(p, REG_MODE_START, RANGING_START)
+    p.write_reg(REG_MODE_START, RANGING_START)
 
 // Stops ranging (SYSTEM__MODE_START = 0x00): whether the part acknowledged.
 pub fn ranging_stop<P: Vl53l1xPort>(p: P) -> Bool [hw]
-    wr(p, REG_MODE_START, RANGING_STOP)
+    p.write_reg(REG_MODE_START, RANGING_STOP)
 
 // The interrupt polarity: `Some(true)` for active high (the default).
 pub fn polarity_read<P: Vl53l1xPort>(p: P) -> ?Bool [hw]
-    let Some(v) = rd(p, REG_GPIO_CTRL) else return None
+    let Some(v) = p.read_reg(REG_GPIO_CTRL) else return None
     Some(((v >> 4) & 1) == 0)
 
 // Sets the interrupt polarity, active high when `high`: whether the part took
@@ -462,7 +455,7 @@ pub fn polarity_write<P: Vl53l1xPort>(p: P, high: Bool) -> Bool [hw]
     var bit = 0x10
     if high
         bit = 0
-    upd(p, REG_GPIO_CTRL, 0x10, bit)
+    p.update_reg(REG_GPIO_CTRL, 0x10, bit)
 
 // The VHV calibration cycle of `SensorInit` (and, with `full`, of the
 // temperature update): one ranging, waited for, cleared and stopped, then the
@@ -472,11 +465,11 @@ pub fn polarity_write<P: Vl53l1xPort>(p: P, high: Bool) -> Bool [hw]
 pub fn vhv_cycle<P: Vl53l1xPort>(p: P, full: Bool) -> Bool [hw]
     var ok = true
     if full
-        ok = wr(p, REG_VHV_LOOP_BOUND, VHV_FULL) and wr(p, REG_VHV_TEMP, VHV_TEMP_FULL)
+        ok = p.write_reg(REG_VHV_LOOP_BOUND, VHV_FULL) and p.write_reg(REG_VHV_TEMP, VHV_TEMP_FULL)
     if ok
         ok = ranging_start(p) and ready_wait(p, CAL_WAIT_MS) and interrupt_clear(p)
     let stopped = ranging_stop(p)
-    let back = wr(p, REG_VHV_LOOP_BOUND, VHV_TWO_BOUNDS) and wr(p, REG_VHV_TEMP, 0x00)
+    let back = p.write_reg(REG_VHV_LOOP_BOUND, VHV_TWO_BOUNDS) and p.write_reg(REG_VHV_TEMP, 0x00)
     ok and stopped and back
 
 // ── The initialisation ───────────────────────────────────────────────
@@ -505,7 +498,7 @@ pub fn start<P: Vl53l1xPort>(p: P, io_2v8: Bool) -> Bool [hw]
     if not (model_ok(p) and boot_wait(p) and config_write(p))
         return false
     if io_2v8
-        if not upd(p, REG_IO_SUPPLY, 0x01, 0x01)
+        if not p.update_reg(REG_IO_SUPPLY, 0x01, 0x01)
             return false
     vhv_cycle(p, false)
 
@@ -582,7 +575,7 @@ pub fn budget_ms_of_word(a: Int) -> Int
 // The distance mode the part is in, from the phase-calibration timeout, or
 // `None` when that holds neither mode's value or the part did not answer.
 pub fn mode_read<P: Vl53l1xPort>(p: P) -> ?Vl53Mode [hw]
-    let Some(v) = rd(p, REG_PHASECAL) else return None
+    let Some(v) = p.read_reg(REG_PHASECAL) else return None
     if v == PHASECAL_SHORT
         return Some(Vl53Mode.Vl53Short)
     if v == PHASECAL_LONG
@@ -592,7 +585,7 @@ pub fn mode_read<P: Vl53l1xPort>(p: P) -> ?Vl53Mode [hw]
 // The timing budget in milliseconds, `None` when the part did not answer, 0 for
 // a budget the tables do not have.
 pub fn budget_get<P: Vl53l1xPort>(p: P) -> ?Int [hw]
-    let Some(a) = rd16(p, REG_TIMEOUT_A) else return None
+    let Some(a) = p.read_reg16_be(REG_TIMEOUT_A) else return None
     Some(budget_ms_of_word(a))
 
 // The timing budget in milliseconds, 0 when the part did not answer or holds a
@@ -609,7 +602,7 @@ pub fn budget_write<P: Vl53l1xPort>(p: P, ms: Int) -> Bool [hw]
     let w = budget_words(mode, ms)
     if w < 0
         return false
-    wr16(p, REG_TIMEOUT_A, (w >> 16) & 0xFFFF) and wr16(p, REG_TIMEOUT_B, w & 0xFFFF)
+    p.write_reg16_be(REG_TIMEOUT_A, (w >> 16) & 0xFFFF) and p.write_reg16_be(REG_TIMEOUT_B, w & 0xFFFF)
 
 // The budget a new mode keeps from the old one: the same size when the new
 // mode has a row for it, else 33 ms, the least that works in every mode; 100
@@ -629,16 +622,16 @@ pub fn mode_write<P: Vl53l1xPort>(p: P, mode: Vl53Mode) -> Bool [hw]
     var ok = false
     match mode
         Vl53Short =>
-            ok = wr(p, REG_PHASECAL, PHASECAL_SHORT) and wr(p, REG_VCSEL_A, 0x07) and wr(p, REG_VCSEL_B, 0x05) and wr(p, REG_PHASE_HIGH, 0x38) and wr16(p, REG_WOI, 0x0705) and wr16(p, REG_INITIAL_PHASE, 0x0606)
+            ok = p.write_reg(REG_PHASECAL, PHASECAL_SHORT) and p.write_reg(REG_VCSEL_A, 0x07) and p.write_reg(REG_VCSEL_B, 0x05) and p.write_reg(REG_PHASE_HIGH, 0x38) and p.write_reg16_be(REG_WOI, 0x0705) and p.write_reg16_be(REG_INITIAL_PHASE, 0x0606)
         Vl53Long  =>
-            ok = wr(p, REG_PHASECAL, PHASECAL_LONG) and wr(p, REG_VCSEL_A, 0x0F) and wr(p, REG_VCSEL_B, 0x0D) and wr(p, REG_PHASE_HIGH, 0xB8) and wr16(p, REG_WOI, 0x0F0D) and wr16(p, REG_INITIAL_PHASE, 0x0E0E)
+            ok = p.write_reg(REG_PHASECAL, PHASECAL_LONG) and p.write_reg(REG_VCSEL_A, 0x0F) and p.write_reg(REG_VCSEL_B, 0x0D) and p.write_reg(REG_PHASE_HIGH, 0xB8) and p.write_reg16_be(REG_WOI, 0x0F0D) and p.write_reg16_be(REG_INITIAL_PHASE, 0x0E0E)
     ok and budget_write(p, budget_for_mode(old, mode))
 
 // The inter-measurement period in milliseconds, 0 when the part did not
 // answer or its oscillator value reads 0.  The register is in oscillator
 // ticks: `RESULT__OSC_CALIBRATE_VAL` (bits 9:0) times the period times 1.075.
 pub fn intermeasure_read<P: Vl53l1xPort>(p: P) -> Int [hw]
-    let Some(osc) = rd16(p, REG_OSC) else return 0
+    let Some(osc) = p.read_reg16_be(REG_OSC) else return 0
     let Some(ticks) = rd32(p, REG_INTERMEASURE) else return 0
     let denom = (osc & 0x3FF) * IM_NUM
     if denom == 0
@@ -651,7 +644,7 @@ pub fn intermeasure_read<P: Vl53l1xPort>(p: P) -> Int [hw]
 pub fn intermeasure_write<P: Vl53l1xPort>(p: P, ms: Int) -> Bool [hw]
     if ms < 1 or ms > 65535
         return false
-    let Some(osc) = rd16(p, REG_OSC) else return false
+    let Some(osc) = p.read_reg16_be(REG_OSC) else return false
     let clock = osc & 0x3FF
     if clock == 0
         return false
@@ -663,7 +656,7 @@ pub fn intermeasure_write<P: Vl53l1xPort>(p: P, ms: Int) -> Bool [hw]
 // register is MCPS in 9.7 fixed point and the ultra-lite driver's unit is the
 // register times 8.
 pub fn signal_limit_read<P: Vl53l1xPort>(p: P) -> Int [hw]
-    let Some(v) = rd16(p, REG_MIN_RATE) else return -1
+    let Some(v) = p.read_reg16_be(REG_MIN_RATE) else return -1
     v << 3
 
 // Sets the signal limit in kilo-counts a second, 0 to 524,280 (the register is
@@ -671,12 +664,12 @@ pub fn signal_limit_read<P: Vl53l1xPort>(p: P) -> Int [hw]
 pub fn signal_limit_write<P: Vl53l1xPort>(p: P, kcps: Int) -> Bool [hw]
     if kcps < 0 or kcps > 0x7FFF8
         return false
-    wr16(p, REG_MIN_RATE, kcps >> 3)
+    p.write_reg16_be(REG_MIN_RATE, kcps >> 3)
 
 // The maximum sigma for a valid range, in millimetres: the register is 14.2
 // fixed point, so it holds up to 16383 mm.
 pub fn sigma_limit_read<P: Vl53l1xPort>(p: P) -> Int [hw]
-    let Some(v) = rd16(p, REG_SIGMA) else return -1
+    let Some(v) = p.read_reg16_be(REG_SIGMA) else return -1
     v >> 2
 
 // Sets the sigma limit in millimetres, 0 to 16383: false for a value outside that
@@ -684,7 +677,7 @@ pub fn sigma_limit_read<P: Vl53l1xPort>(p: P) -> Int [hw]
 pub fn sigma_limit_write<P: Vl53l1xPort>(p: P, mm: Int) -> Bool [hw]
     if mm < 0 or mm > 0x3FFF
         return false
-    wr16(p, REG_SIGMA, mm << 2)
+    p.write_reg16_be(REG_SIGMA, mm << 2)
 
 // The code a window takes in SYSTEM__INTERRUPT_CONFIG_GPIO bits 2:0.
 pub fn window_code(w: Vl53Window) -> Int
@@ -708,11 +701,11 @@ pub fn threshold_write<P: Vl53l1xPort>(p: P, low: Int, high: Int, w: Vl53Window,
     var cfg = window_code(w)
     if no_target
         cfg = cfg | INT_NO_TARGET
-    wr(p, REG_INT_CONFIG, cfg) and wr16(p, REG_THRESH_HIGH, high) and wr16(p, REG_THRESH_LOW, low)
+    p.write_reg(REG_INT_CONFIG, cfg) and p.write_reg16_be(REG_THRESH_HIGH, high) and p.write_reg16_be(REG_THRESH_LOW, low)
 
 // Puts the interrupt back to "new sample ready", the table's own setting.
 pub fn interrupt_new_sample<P: Vl53l1xPort>(p: P) -> Bool [hw]
-    wr(p, REG_INT_CONFIG, INT_NEW_SAMPLE)
+    p.write_reg(REG_INT_CONFIG, INT_NEW_SAMPLE)
 
 // ── The region of interest ───────────────────────────────────────────
 
@@ -760,7 +753,7 @@ pub fn roi_write<P: Vl53l1xPort>(p: P, r: Vl53Roi) -> Bool [hw]
 // the part's optical centre (the NVM register 0x013E), and to 199 for a region
 // wider or taller than 10.
 pub fn roi_size_write<P: Vl53l1xPort>(p: P, w: Int, h: Int) -> Bool [hw]
-    let Some(optical) = rd(p, REG_OPTICAL_CENTRE) else return false
+    let Some(optical) = p.read_reg(REG_OPTICAL_CENTRE) else return false
     var centre = optical
     if w > 10 or h > 10
         centre = ROI_FULL_CENTRE
@@ -951,19 +944,19 @@ pub fn div_trunc(a: Int, b: Int) -> Int
 // The offset in millimetres: the register holds it with two fraction bits in
 // 13 bits two's complement.
 pub fn offset_read<P: Vl53l1xPort>(p: P) -> ?Int [hw]
-    let Some(v) = rd16(p, REG_PART_OFFSET) else return None
+    let Some(v) = p.read_reg16_be(REG_PART_OFFSET) else return None
     Some(div_trunc(dev_bus.dev_sign_extend(v, 13), 4))
 
 // Sets the offset (`SetOffset`) and clears the two other offset registers.
 pub fn offset_write<P: Vl53l1xPort>(p: P, mm: Int) -> Bool [hw]
     if mm < -1024 or mm > 1023
         return false
-    wr16(p, REG_PART_OFFSET, (mm * 4) & 0xFFFF) and wr16(p, REG_INNER_OFFSET, 0) and wr16(p, REG_OUTER_OFFSET, 0)
+    p.write_reg16_be(REG_PART_OFFSET, (mm * 4) & 0xFFFF) and p.write_reg16_be(REG_INNER_OFFSET, 0) and p.write_reg16_be(REG_OUTER_OFFSET, 0)
 
 // The crosstalk plane offset in counts a second: the register is kilo-counts in
 // 7.9 fixed point.
 pub fn xtalk_read<P: Vl53l1xPort>(p: P) -> ?Int [hw]
-    let Some(v) = rd16(p, REG_XTALK_OFFSET) else return None
+    let Some(v) = p.read_reg16_be(REG_XTALK_OFFSET) else return None
     Some((v * 1000) >> 9)
 
 // Sets the crosstalk (`SetXtalk`): the two gradients cleared and the plane offset
@@ -971,7 +964,7 @@ pub fn xtalk_read<P: Vl53l1xPort>(p: P) -> ?Int [hw]
 pub fn xtalk_write<P: Vl53l1xPort>(p: P, cps: Int) -> Bool [hw]
     if cps < 0 or cps > 127998
         return false
-    wr16(p, REG_XTALK_X, 0) and wr16(p, REG_XTALK_Y, 0) and wr16(p, REG_XTALK_OFFSET, (cps << 9) / 1000)
+    p.write_reg16_be(REG_XTALK_X, 0) and p.write_reg16_be(REG_XTALK_Y, 0) and p.write_reg16_be(REG_XTALK_OFFSET, (cps << 9) / 1000)
 
 // Ranges `n` times and adds up the results that carry a distance (valid or
 // weak): the sums, or `None` when the part stopped answering, a result did not
@@ -1024,7 +1017,7 @@ pub fn calibrate_offset<P: Vl53l1xPort>(p: P, target_mm: Int) -> ?Int [hw]
 pub fn calibrate_xtalk<P: Vl53l1xPort>(p: P, target_mm: Int) -> ?Int [hw]
     if target_mm <= 0
         return None
-    if not wr16(p, REG_XTALK_OFFSET, 0)
+    if not p.write_reg16_be(REG_XTALK_OFFSET, 0)
         return None
     let Some(s) = sums_run(p, CAL_RESULTS) else return None
     if s.spads == 0
@@ -1034,7 +1027,7 @@ pub fn calibrate_xtalk<P: Vl53l1xPort>(p: P, target_mm: Int) -> ?Int [hw]
         reg = 0
     if reg > 0xFFFF
         reg = 0xFFFF
-    if not wr16(p, REG_XTALK_OFFSET, reg)
+    if not p.write_reg16_be(REG_XTALK_OFFSET, reg)
         return None
     Some((reg * 1000) >> 9)
 
@@ -1050,15 +1043,21 @@ struct Vl53l1x
     w: DeviceWiring
     st: Vl53State
 
-impl Vl53l1xPort for Vl53l1x
-    fn setup(self) -> Bool [hw]
-        i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for Vl53l1x
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         i2c_read_into(self.bus, self.w, reg, n, var dst)
 
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        var src: DevBytes = Vec.new()
+        let _ = src.push((v & 0xFF) as u8)
+        i2c_write_from(self.bus, self.w, reg, src)
+
     fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
         i2c_write_from(self.bus, self.w, reg, src)
+
+impl Vl53l1xPort for Vl53l1x
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.pins, self.w)
 
     fn now_ms(self) -> Int [hw]
         self.timer.ticks_ms()
@@ -1067,7 +1066,7 @@ impl Vl53l1xPort for Vl53l1x
         self.timer.delay_ms(ms)
 
     fn irq_level(self) -> Int [hw]
-        irq_level_of(self.pins, self.w)
+        dev_bus.wiring_irq_level(self.pins, self.w)
 
     fn xshut(self, level: Int) -> Bool [hw]
         xshut_of(self.pins, self.w, level)
@@ -1213,13 +1212,13 @@ impl Vl53l1x
     // Moves the part to another I2C address, which it keeps until the next
     // power-up or XSHUT, and follows it: whether the part took the write.
     fn move_to(var self, addr: Int) -> Bool [hw]
-        let ok = wr(self, REG_I2C_ADDRESS, addr & 0x7F)
+        let ok = self.write_reg(REG_I2C_ADDRESS, addr & 0x7F)
         self = with_addr(self, ok, addr)
         ok
 
     // One register, for the registers this driver does not name.
     fn reg(self, r: Int) -> ?Int [hw]
-        rd(self, r)
+        self.read_reg(r)
 
 impl Rangefinder[hw] for Vl53l1x
     // Starts ranging and answers the budget in microseconds, the time one

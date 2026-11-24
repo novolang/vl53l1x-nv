@@ -29,7 +29,7 @@ main    = "src/main.nv"
 
 [dependencies]
 vl53l1x-nv       = { path = "$PKG" }
-devices-nv      = "^0.4.0"
+devices-nv      = "^0.4.1"
 embedded-hal-nv = "^0.4.0"
 EOF
 
