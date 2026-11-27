@@ -1,6 +1,6 @@
 [package]
 name        = "vl53l1x-nv"
-version     = "0.2.0"
+version     = "0.2.1"
 description = "A driver for ST's VL53L1X long-distance time-of-flight ranging sensor on an I2C bus: the 91-byte default configuration, the short and long distance modes, the timing budget and inter-measurement period, ranging with the range status, signal and ambient rates, the region of interest from 4 by 4 up to 16 by 16 SPADs and a 4 by 4 zone scan, the distance thresholds, the offset and cross-talk calibrations, the interrupt polarity, the I2C address change and XSHUT, as devices-nv's Rangefinder, RangefinderZones and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"

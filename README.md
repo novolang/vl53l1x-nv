@@ -91,8 +91,8 @@ fn main() [hw]
     hal.timer.delay_ms(5)
     if not sensor.begin()
         hal.uart.write("no answer from the sensor at 0x29\n")
-    let _ = sensor.set_mode(Vl53Mode.Vl53Long)
-    let _ = sensor.set_budget_ms(100)
+    sensor.set_mode(Vl53Mode.Vl53Long)
+    sensor.set_budget_ms(100)
     while true
         if sensor.range_start() < 0
             hal.uart.write("no answer\n")
